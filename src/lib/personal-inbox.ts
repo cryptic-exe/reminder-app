@@ -8,12 +8,15 @@ import {
 } from "@/lib/chat-routing";
 import { formatInUserTz } from "@/lib/time";
 import { getUserTimezone } from "@/lib/env";
+import { generatePersonalDmReply } from "@/lib/llm/dm-reply";
 import { sendWhatsAppText } from "@/lib/waha";
 
 export type PersonalInboxResult = {
   action: string;
   id?: string;
   ignored?: boolean;
+  reply?: string;
+  needsHuman?: boolean;
 };
 
 function displayName(chatId: string, pushName?: string | null): string {
@@ -35,9 +38,10 @@ async function ensureOwnerTarget(): Promise<{ id: string; chatId: string } | nul
 }
 
 /**
- * Someone DMed the WAHA-linked number (acting as you).
- * Queue a reminder on your personal phone to reply, with context.
- * Does not reply in the DM thread.
+ * Personal DM on the WAHA-linked number:
+ * 1) AI reads the message and replies in-thread
+ * 2) If unsure → "I'm an AI — Deepak will get back to you."
+ * 3) When human follow-up is needed → reminder on OWNER_NOTIFY_CHAT_ID
  */
 export async function processPersonalDm(input: {
   messageId: string;
@@ -63,28 +67,55 @@ export async function processPersonalDm(input: {
     return { action: "create-dup", ignored: true };
   }
 
-  const owner = await ensureOwnerTarget();
-  if (!owner) {
-    console.warn(
-      "[personal-inbox] OWNER_NOTIFY_CHAT_ID not set — cannot queue reply reminder",
-    );
-    return { action: "no-owner-target", ignored: true };
-  }
-
   const who = displayName(input.chatId, input.pushName);
   const snippet = text.length > 120 ? `${text.slice(0, 117)}…` : text;
-  const title = `Reply to ${who}: ${snippet}`;
+
+  const ai = await generatePersonalDmReply({ text, fromName: who });
+
+  // Reply in the same personal chat (acting on Deepak's linked number)
+  await sendWhatsAppText(ai.reply, input.chatId).catch((err) => {
+    console.warn(
+      "[personal-inbox] reply send failed:",
+      err instanceof Error ? err.message : err,
+    );
+  });
+
+  if (!ai.needsHuman) {
+    // Optional light notify — AI handled it
+    const ownerChat = getOwnerNotifyChatId();
+    if (ownerChat) {
+      await sendWhatsAppText(
+        `✅ AI replied to ${who}\nThem: ${snippet}\nBot: ${ai.reply.slice(0, 160)}`,
+        ownerChat,
+      ).catch(() => undefined);
+    }
+    return {
+      action: "personal-ai-reply",
+      reply: ai.reply,
+      needsHuman: false,
+    };
+  }
+
+  // Needs Deepak — queue reminder on personal phone
+  const owner = await ensureOwnerTarget();
+  if (!owner) {
+    return {
+      action: "personal-ai-fallback",
+      reply: ai.reply,
+      needsHuman: true,
+    };
+  }
+
   const delayMin = getPersonalReplyDelayMinutes();
   const dueAt = new Date(Date.now() + delayMin * 60_000);
-
   const reminder = await prisma.reminder.create({
     data: {
-      title,
+      title: `Reply to ${who}: ${snippet}`,
       body: [
-        `Incoming WhatsApp DM on your linked number.`,
+        `AI could not fully answer — follow up needed.`,
         `From: ${who} (${input.chatId})`,
         `Message: ${text}`,
-        `Open that chat and reply when this fires.`,
+        `AI said: ${ai.reply}`,
       ].join("\n"),
       dueAt,
       rawInput: `personal-dm: ${text}`,
@@ -95,12 +126,16 @@ export async function processPersonalDm(input: {
     },
   });
 
-  // Quiet ack only on your phone — never in the other person's chat
   const dueLabel = formatInUserTz(dueAt.toISOString(), getUserTimezone());
   await sendWhatsAppText(
-    `📥 Reply later\n${who}: ${snippet}\nRemind at: ${dueLabel}\nid:${reminder.id.slice(-6)}`,
+    `🤝 Needs you\n${who}: ${snippet}\nAI: ${ai.reply}\nRemind: ${dueLabel}\nid:${reminder.id.slice(-6)}`,
     owner.chatId,
   ).catch(() => undefined);
 
-  return { action: "personal-reply-reminder", id: reminder.id };
+  return {
+    action: "personal-ai-needs-human",
+    id: reminder.id,
+    reply: ai.reply,
+    needsHuman: true,
+  };
 }

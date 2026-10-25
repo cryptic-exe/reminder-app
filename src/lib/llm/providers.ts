@@ -38,12 +38,13 @@ export const PLATFORM_REGISTRY: Record<string, ProviderEndpoint> = {
   groq: {
     id: "groq",
     baseURL: "https://api.groq.com/openai/v1",
-    models: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"],
+    // Free/dev tier: llama-3.3-70b-versatile / 3.1-8b-instant shut down Aug 2026
+    models: ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile"],
   },
   google: {
     id: "google",
     baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
-    models: ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash"],
+    models: ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"],
   },
   cerebras: {
     id: "cerebras",
