@@ -268,15 +268,35 @@ export async function processPersonalDm(input: {
   const mode = await getSessionMode(input.chatId);
 
   if (mode === "owner") {
+    // Still queue + ask so owner can flip AI back on with YES
+    const row = await prisma.personalDmQueue.create({
+      data: {
+        messageId: input.messageId,
+        chatId: input.chatId,
+        text,
+        pushName: input.pushName?.trim() || null,
+        receivedAt: new Date(),
+        replyAfter: new Date(),
+        status: "awaiting_owner",
+      },
+    });
+    const who = displayName(input.chatId, input.pushName);
     const ownerChat = getOwnerNotifyChatId();
+    const ref = shortRef(row.id);
     if (ownerChat) {
-      const who = displayName(input.chatId, input.pushName);
       await sendWhatsAppText(
-        `📩 ${who} (aap handle kar rahe ho)\n${text.slice(0, 200)}`,
+        [
+          `📩 ${who} (abhi aap handle kar rahe ho)`,
+          text.slice(0, 200),
+          ``,
+          `AI ON karna hai?`,
+          `YES ${ref} / AI ON ${ref}`,
+          `NO ${ref} — aap hi continue`,
+        ].join("\n"),
         ownerChat,
       ).catch(() => undefined);
     }
-    return { action: "personal-owner-mode", ignored: true };
+    return { action: "personal-owner-mode-ask", id: row.id };
   }
 
   const row = await prisma.personalDmQueue.create({
@@ -287,7 +307,7 @@ export async function processPersonalDm(input: {
       pushName: input.pushName?.trim() || null,
       receivedAt: new Date(),
       replyAfter: new Date(),
-      status: mode === "ai" ? "awaiting_owner" : "awaiting_owner",
+      status: "awaiting_owner",
     },
   });
 
@@ -299,22 +319,25 @@ export async function processPersonalDm(input: {
 }
 
 function parseOwnerDecision(text: string): {
-  decision: "yes" | "no" | "ai_off" | null;
+  decision: "yes" | "no" | "ai_off" | "ai_on" | null;
   ref: string | null;
 } {
   const t = text.trim().toLowerCase().replace(/\s+/g, " ");
-  const refMatch = t.match(/\b([a-z0-9]{4,8})\s*$/i);
-  const ref = refMatch?.[1] && !/^(yes|no|haan|han|na|ai|off|on)$/i.test(refMatch[1])
-    ? refMatch[1]
-    : null;
+  const refMatch = t.match(/\b([a-z0-9]{4,10})\s*$/i);
+  const ref =
+    refMatch?.[1] &&
+    !/^(yes|no|haan|han|na|ai|off|on|ok|y|n)$/i.test(refMatch[1])
+      ? refMatch[1]
+      : null;
 
   if (/^(ai\s*off|stop\s*ai)\b/.test(t)) {
     return { decision: "ai_off", ref };
   }
-  if (
-    /^(yes|y|haan|han|ha|ai(\s+yes)?|ok\s*ai)\b/.test(t) ||
-    /^yes\b/.test(t)
-  ) {
+  // Must check AI ON before bare "ai…" / yes
+  if (/^(ai\s*on|start\s*ai|enable\s*ai)\b/.test(t)) {
+    return { decision: "ai_on", ref };
+  }
+  if (/^(yes|y|haan|han|ha|ai\s*yes|ok\s*ai)\b/.test(t)) {
     return { decision: "yes", ref };
   }
   if (/^(no|n|na|nahi|owner|main|me)\b/.test(t)) {
@@ -323,36 +346,133 @@ function parseOwnerDecision(text: string): {
   return { decision: null, ref: null };
 }
 
-async function findQueueForDecision(ref: string | null) {
-  const ownerIds = new Set(
+async function ownerIdsSet(): Promise<Set<string>> {
+  return new Set(
     (await ensureOwnerNotifyIdentities()).map(normalizeChatId),
   );
+}
 
+async function findQueueForDecision(ref: string | null) {
+  const ownerIds = await ownerIdsSet();
   const notOwner = (chatId: string) => !ownerIds.has(normalizeChatId(chatId));
 
   if (ref) {
-    const matches = (
+    // Match awaiting_owner first, then any recent queue row (for AI ON after NO)
+    const awaiting = (
       await prisma.personalDmQueue.findMany({
-        where: {
-          status: "awaiting_owner",
-          id: { endsWith: ref },
-        },
+        where: { status: "awaiting_owner", id: { endsWith: ref } },
         orderBy: { createdAt: "desc" },
         take: 10,
       })
     ).filter((m) => notOwner(m.chatId));
-    if (matches.length >= 1) {
-      return matches.find((m) => m.id.endsWith(ref)) ?? matches[0];
+    if (awaiting.length >= 1) {
+      return awaiting.find((m) => m.id.endsWith(ref)) ?? awaiting[0];
     }
+
+    const any = (
+      await prisma.personalDmQueue.findMany({
+        where: { id: { endsWith: ref } },
+        orderBy: { createdAt: "desc" },
+        take: 10,
+      })
+    ).filter((m) => notOwner(m.chatId));
+    if (any.length >= 1) return any[0] ?? null;
   }
 
-  // Prefer real customer DMs — never the owner's own YES/NO echoed as queue rows
   const pending = await prisma.personalDmQueue.findMany({
     where: { status: "awaiting_owner" },
     orderBy: { createdAt: "desc" },
     take: 20,
   });
   return pending.find((m) => notOwner(m.chatId)) ?? null;
+}
+
+/** Turn AI back on for a chat (no pending required). */
+async function enableAiForChat(
+  chatId: string,
+  pushName: string | null,
+  latestText?: string | null,
+): Promise<PersonalInboxResult> {
+  await setSessionMode(chatId, "ai");
+  const ownerChat = getOwnerNotifyChatId();
+  const who = displayName(chatId, pushName);
+
+  if (latestText?.trim()) {
+    const row = await prisma.personalDmQueue.create({
+      data: {
+        messageId: `ai-on-${Date.now()}`,
+        chatId,
+        text: latestText.trim(),
+        pushName,
+        receivedAt: new Date(),
+        replyAfter: new Date(),
+        status: "awaiting_owner",
+      },
+    });
+    const result = await sendAiReplyForItem(row);
+    if (ownerChat) {
+      await sendWhatsAppText(
+        `OK — AI ON for ${who}. AI ab handle karega.`,
+        ownerChat,
+      ).catch(() => undefined);
+    }
+    return { ...result, action: "personal-ai-on" };
+  }
+
+  if (ownerChat) {
+    await sendWhatsAppText(
+      `OK — AI ON for ${who}. Agla message AI handle karega.`,
+      ownerChat,
+    ).catch(() => undefined);
+  }
+  return { action: "personal-ai-on", id: chatId };
+}
+
+async function resolveChatForAiOn(ref: string | null): Promise<{
+  chatId: string;
+  pushName: string | null;
+  text: string | null;
+} | null> {
+  const item = await findQueueForDecision(ref);
+  if (item) {
+    return {
+      chatId: item.chatId,
+      pushName: item.pushName,
+      text: item.status === "awaiting_owner" ? item.text : item.text,
+    };
+  }
+
+  const ownerIds = await ownerIdsSet();
+  if (ref) {
+    const byRef = await prisma.personalDmQueue.findFirst({
+      where: { id: { endsWith: ref } },
+      orderBy: { createdAt: "desc" },
+    });
+    if (byRef && !ownerIds.has(normalizeChatId(byRef.chatId))) {
+      return {
+        chatId: byRef.chatId,
+        pushName: byRef.pushName,
+        text: byRef.text,
+      };
+    }
+  }
+
+  const ownerSession = await prisma.personalDmSession.findFirst({
+    where: { mode: "owner" },
+    orderBy: { updatedAt: "desc" },
+  });
+  if (ownerSession && !ownerIds.has(normalizeChatId(ownerSession.chatId))) {
+    const last = await prisma.personalDmQueue.findFirst({
+      where: { chatId: ownerSession.chatId },
+      orderBy: { createdAt: "desc" },
+    });
+    return {
+      chatId: ownerSession.chatId,
+      pushName: last?.pushName ?? null,
+      text: last?.text ?? null,
+    };
+  }
+  return null;
 }
 
 /**
@@ -402,6 +522,25 @@ export async function processOwnerHandoffDecision(input: {
     return { action: "personal-ai-off", id: chatId };
   }
 
+  if (decision === "ai_on" || decision === "yes") {
+    const item = await findQueueForDecision(ref);
+    if (item && item.status === "awaiting_owner") {
+      return sendAiReplyForItem(item);
+    }
+    // Re-enable AI for a chat that was on owner-mode (no fresh pending)
+    const target = await resolveChatForAiOn(ref);
+    if (!target) {
+      if (ownerChat) {
+        await sendWhatsAppText(
+          "Koi chat nahi mili. Naya DM aaye to YES / AI ON bhejna.",
+          ownerChat,
+        ).catch(() => undefined);
+      }
+      return { action: "personal-no-pending", ignored: true };
+    }
+    return enableAiForChat(target.chatId, target.pushName, target.text);
+  }
+
   const item = await findQueueForDecision(ref);
   if (!item) {
     if (ownerChat) {
@@ -425,15 +564,14 @@ export async function processOwnerHandoffDecision(input: {
     });
     if (ownerChat) {
       await sendWhatsAppText(
-        `OK — aap reply karo (${displayName(item.chatId, item.pushName)}). AI quiet rahega.`,
+        `OK — aap reply karo (${displayName(item.chatId, item.pushName)}). AI quiet. Wapas: AI ON`,
         ownerChat,
       ).catch(() => undefined);
     }
     return { action: "personal-owner-will-reply", id: item.id };
   }
 
-  // YES — AI takes over
-  return sendAiReplyForItem(item);
+  return { action: "owner-ignored", ignored: true };
 }
 
 /** @deprecated Delay path removed; kept so cron/webhook imports don't break. */
