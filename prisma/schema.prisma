@@ -1,0 +1,69 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ReminderStatus {
+  pending
+  sending
+  sent
+  failed
+  cancelled
+}
+
+enum RecurrenceType {
+  none
+  daily
+  weekly
+}
+
+model ChatTarget {
+  id        String     @id @default(cuid())
+  name      String
+  chatId    String
+  isDefault Boolean    @default(false)
+  createdAt DateTime   @default(now())
+  reminders Reminder[]
+}
+
+model Tag {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  color     String     @default("#0f766e")
+  reminders Reminder[] @relation("ReminderTags")
+}
+
+model Reminder {
+  id                String         @id @default(cuid())
+  title             String
+  body              String?
+  dueAt             DateTime
+  status            ReminderStatus @default(pending)
+  rawInput          String
+  whatsappMessageId String?
+  lastError         String?
+  /// Local path under .data/voice for WhatsApp voice notes to re-send
+  voicePath         String?
+  voiceMime         String?
+  createdAt         DateTime       @default(now())
+  sentAt            DateTime?
+
+  /// none | daily | weekly
+  recurrenceType    RecurrenceType @default(none)
+  /// For weekly: 0=Sun … 6=Sat (JS getDay). Empty = same weekday as dueAt.
+  recurrenceWeekdays Int[]         @default([])
+  /// Minutes before due for an optional early ping (0 = off)
+  notifyBeforeMinutes Int          @default(0)
+
+  chatTargetId String?
+  chatTarget   ChatTarget? @relation(fields: [chatTargetId], references: [id], onDelete: SetNull)
+
+  tags Tag[] @relation("ReminderTags")
+
+  @@index([status, dueAt])
+  @@index([chatTargetId])
+}
