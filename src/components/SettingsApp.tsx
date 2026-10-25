@@ -175,9 +175,10 @@ export function SettingsApp() {
           {webhookUrl}?secret=YOUR_CRON_SECRET
         </p>
         <p className="mt-2 text-xs text-zinc-500">
-          In the reminder chat: text (“snooze 10”, “cancel it”, “list”) or send
-          a <strong>voice note</strong> — it’s transcribed, saved, and the same
-          audio is re-sent when due.
+          <strong>Reminders group only:</strong> “remind…”, snooze, list, voice
+          notes. <strong>Personal DMs</strong> to the WAHA-linked number quietly
+          queue a “reply later” ping on your notify phone (OWNER_NOTIFY_CHAT_ID)
+          — the other person gets no bot reply.
         </p>
       </section>
     </div>

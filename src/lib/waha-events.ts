@@ -1,19 +1,6 @@
-import { getWahaConfig, getWahaServerConfig } from "@/lib/env";
-import { claimFingerprint, claimMessageId } from "@/lib/inbound-dedupe";
-import {
-  isBotEcho,
-  looksLikeUserCommand,
-  processInboundText,
-} from "@/lib/inbound";
-import { processInboundVoice } from "@/lib/inbound-voice";
-import { prisma } from "@/lib/db";
+import { getWahaServerConfig } from "@/lib/env";
+import { routeInboundMessage } from "@/lib/inbound-router";
 
-async function isWatchedChat(chatId: string): Promise<boolean> {
-  const { chatId: envChatId } = getWahaConfig();
-  if (envChatId && chatId === envChatId) return true;
-  const hit = await prisma.chatTarget.findFirst({ where: { chatId } });
-  return Boolean(hit);
-}
 
 let started = false;
 let socket: WebSocket | null = null;
@@ -148,50 +135,19 @@ async function handleEvent(raw: string) {
   const msg = extractMessage(data);
   if (!msg) return;
 
-  // Voice notes in the reminder group/chat (any phone — WAHA linked number may differ)
-  if (isAudioMedia(msg.media) && msg.source !== "api") {
-    const watched = await isWatchedChat(msg.chatId);
-    if (watched) {
-      try {
-        const result = await processInboundVoice({
-          messageId: msg.id || `voice-${Date.now()}`,
-          chatId: msg.chatId,
-          caption: msg.text || null,
-          media: msg.media,
-        });
-        if (!result.ignored) {
-          console.log(
-            `[waha-ws] ${result.action}${result.id ? ` ${result.id}` : ""} ← voice`,
-          );
-        }
-      } catch (err) {
-        console.warn(
-          "[waha-ws] voice handle failed:",
-          err instanceof Error ? err.message : err,
-        );
-      }
-      return;
-    }
-  }
-
-  if (!msg.text) return;
-  if (isBotEcho(msg.text)) return;
-  if (!looksLikeUserCommand(msg.text)) return;
-  if (
-    msg.source === "api" &&
-    !/^(snooze|list|cancel|remind|reminder|schedule)\b/i.test(msg.text)
-  ) {
-    return;
-  }
-
-  if (!(await claimMessageId(msg.id))) return;
-  if (!(await claimFingerprint(msg.text))) return;
-
   try {
-    const result = await processInboundText(msg.text, msg.chatId);
+    const result = await routeInboundMessage({
+      messageId: msg.id || `ws-${Date.now()}`,
+      chatId: msg.chatId,
+      text: msg.text,
+      fromMe: msg.fromMe,
+      source: msg.source,
+      media: msg.media,
+      hasMedia: isAudioMedia(msg.media) || msg.media.hasMedia,
+    });
     if (!result.ignored) {
       console.log(
-        `[waha-ws] ${result.action}${result.id ? ` ${result.id}` : ""} ← ${msg.text.slice(0, 40)}`,
+        `[waha-ws] ${result.action}${result.id ? ` ${result.id}` : ""} ← ${msg.chatId}`,
       );
     }
   } catch (err) {
