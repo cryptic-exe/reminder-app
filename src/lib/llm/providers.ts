@@ -293,7 +293,7 @@ function readKeysRaw(): string | null {
     try {
       const resolved = path.isAbsolute(fileHint)
         ? fileHint
-        : path.join(process.cwd(), fileHint);
+        : path.join(/* turbopackIgnore: true */ process.cwd(), fileHint);
       if (fs.existsSync(resolved)) {
         return fs.readFileSync(resolved, "utf8");
       }

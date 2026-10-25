@@ -33,7 +33,7 @@ export async function readVoiceFile(
 ): Promise<{ bytes: Buffer; absPath: string }> {
   const absPath = path.isAbsolute(relativePath)
     ? relativePath
-    : path.join(process.cwd(), relativePath);
+    : path.join(/* turbopackIgnore: true */ process.cwd(), relativePath);
   const bytes = await readFile(absPath);
   return { bytes, absPath };
 }

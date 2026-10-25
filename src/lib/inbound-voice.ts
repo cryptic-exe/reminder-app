@@ -83,7 +83,7 @@ export async function processInboundVoice(input: {
   const parsed = parseReminderLocally(parseText, timezone);
 
   const title =
-    (parsed.confidence >= 0.7 && parsed.title) ||
+    ((parsed.confidence ?? 0) >= 0.7 && parsed.title) ||
     (transcript && transcript.slice(0, 80)) ||
     (caption && caption.slice(0, 80)) ||
     "Voice reminder";
