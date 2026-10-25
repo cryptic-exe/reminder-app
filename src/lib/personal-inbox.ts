@@ -9,7 +9,7 @@ import {
 import { formatInUserTz } from "@/lib/time";
 import { getUserTimezone } from "@/lib/env";
 import { generatePersonalDmReply } from "@/lib/llm/dm-reply";
-import { sendWhatsAppText } from "@/lib/waha";
+import { fetchChatMessages, sendWhatsAppText } from "@/lib/waha";
 
 export type PersonalInboxResult = {
   action: string;
@@ -73,7 +73,19 @@ export async function processPersonalDm(input: {
   const who = displayName(input.chatId, input.pushName);
   const snippet = text.length > 120 ? `${text.slice(0, 117)}…` : text;
 
-  const ai = await generatePersonalDmReply({ text, fromName: who });
+  // Recent turns so the bot continues the chat instead of restarting every message
+  const history = await fetchChatMessages(input.chatId, 12)
+    .then((msgs) =>
+      [...msgs]
+        .reverse()
+        .filter((m) => m.body.trim())
+        .filter((m) => m.body.trim() !== text)
+        .slice(-8)
+        .map((m) => ({ fromMe: m.fromMe, text: m.body.trim() })),
+    )
+    .catch(() => [] as Array<{ fromMe: boolean; text: string }>);
+
+  const ai = await generatePersonalDmReply({ text, fromName: who, history });
 
   // Reply in the same personal chat (acting on Deepak's linked number)
   await sendWhatsAppText(ai.reply, input.chatId).catch((err) => {

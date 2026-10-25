@@ -22,6 +22,11 @@ export type DmReplyResult = {
   used: { provider: PlatformId; model: string };
 };
 
+export type DmHistoryTurn = {
+  fromMe: boolean;
+  text: string;
+};
+
 const PER_CALL_TIMEOUT_MS = 12_000;
 const MAX_PROVIDERS = 2;
 
@@ -29,7 +34,7 @@ const MAX_PROVIDERS = 2;
 function prefersHinglish(text: string): boolean {
   if (/[\u0900-\u097F]/.test(text)) return true;
   const t = text.toLowerCase();
-  return /\b(hai|hain|ho|bhai|bhaiya|ji|kya|kese|kaise|kahan|kab|nahi|nahin|mat|thik|theek|acha|accha|haan|han|okji|ok ji|ram ram|namaste|maal|gaadi|factory|uth(a|aya|ao)|bhej|karo|karna|batao|sunao)\b/.test(
+  return /\b(hai|hain|ho|bhai|bhaiya|ji|kya|kese|kaise|kahan|kab|nahi|nahin|mat|thik|theek|acha|accha|haan|han|hua|hu|hun|aap|mai|main|toh|bt(a|ao)|batao|sunao|okji|ok ji|ram ram|namaste|maal|gaadi|factory|uth(a|aya|ao)|bhej|karo|karna|sab|bas)\b/.test(
     t,
   );
 }
@@ -39,34 +44,34 @@ function fallbackReply(text: string): string {
 }
 
 function systemPrompt(): string {
-  return `You answer WhatsApp DMs on behalf of Deepak Mor (India logistics / transport).
-You are Deepak's AI assistant — sound like a real person on WhatsApp, not a corporate bot.
+  return `You chat on WhatsApp as Deepak Mor's AI assistant (India, transport/logistics).
+Sound like a real person texting — short, warm, natural. Not a call-centre bot.
 
 Return ONLY JSON:
 {
-  "reply": "message to send to the person",
+  "reply": "one WhatsApp message",
   "needsHuman": true/false,
   "confidence": 0-1
 }
 
-Language (critical):
-- Mirror the sender's language exactly.
-- Hindi (Devanagari) → reply in natural Hindi.
-- Hinglish (Roman Hindi mixed with English, e.g. "kese ho bhaiya", "maal nahi utha") → reply in the same Hinglish, casual and warm.
-- English → reply in simple English.
-- Do NOT switch to English if they wrote in Hindi/Hinglish.
+Language (must follow):
+- Match the OTHER PERSON's latest messages. If they use Hinglish/Hindi, reply ONLY in that same Hinglish/Hindi. Never switch to English mid-chat.
+- Pure English from them → simple English from you.
 
-Tone:
-- Short WhatsApp style (under ~400 characters). Human, friendly, North-India casual when they are casual ("bhaiya", "ji" ok if they used it).
-- No markdown, no bullet lists, no "As an AI…" fluff.
-- Greetings: match their greeting (Ram Ram / Namaste / Hi) then help.
+Conversation (must follow):
+- You get recent chat history. CONTINUE the thread — do not restart with a fresh greeting every time.
+- If they already said they are fine / asked how you are, answer briefly and move on. Do NOT ask "kaise ho?" again.
+- Never use robotic lines like: "How can I help you today?", "How may I assist you?", "Is there anything else I can help with?"
+- Prefer natural closers: "bolo", "batao", "haan boliye", "theek hai", or just answer.
+- Greetings only when THEY just greeted (hi / ram ram / namaste). One short greeting, not Namaste + full intro every turn.
 
-Content rules:
-- Answer greetings, thanks, simple acknowledgements, and light logistics follow-ups you can safely handle.
-- If it needs Deepak's private knowledge, money, commitments, OTPs, exact schedules/prices you don't know, or anything unsure: needsHuman=true and set reply to the matching fallback:
-  - Hinglish/Hindi: "${FALLBACK_HI}"
-  - English: "${FALLBACK_EN}"
-- Never invent prices, ETAs, addresses, account numbers, or promises.`;
+Content:
+- Small talk and acknowledgements are fine.
+- For pickup/load/factory/payment details you don't actually know: needsHuman=true and use the language-matched fallback below.
+- Hinglish/Hindi fallback: "${FALLBACK_HI}"
+- English fallback: "${FALLBACK_EN}"
+- Never invent ETAs, prices, addresses, OTPs, or promises.
+- Plain text only. No markdown.`;
 }
 
 function extractJson(text: string): unknown {
@@ -80,6 +85,40 @@ function extractJson(text: string): unknown {
   }
 }
 
+function buildUserContent(input: {
+  text: string;
+  fromName: string;
+  history?: DmHistoryTurn[];
+}): string {
+  const corpus = [
+    ...(input.history ?? []).map((h) => h.text),
+    input.text,
+  ].join("\n");
+  const hinglish = prefersHinglish(corpus) || prefersHinglish(input.text);
+  const langHint = hinglish
+    ? "LANGUAGE LOCK: Hinglish/Hindi only. No English sentences."
+    : "LANGUAGE: English is fine.";
+
+  const lines: string[] = [
+    `From: ${input.fromName}`,
+    langHint,
+    "Recent chat (oldest → newest):",
+  ];
+  const hist = (input.history ?? []).slice(-8);
+  if (hist.length === 0) {
+    lines.push("(no prior turns)");
+  } else {
+    for (const turn of hist) {
+      lines.push(`${turn.fromMe ? "Deepak/AI" : "Them"}: ${turn.text}`);
+    }
+  }
+  lines.push(`Them (latest): ${input.text}`);
+  lines.push(
+    "Write the next reply only — continue naturally from the history above.",
+  );
+  return lines.join("\n");
+}
+
 /**
  * Draft a WhatsApp reply for a personal DM.
  * Falls back to the "Deepak will get back" line when LLMs fail or are unsure.
@@ -87,11 +126,14 @@ function extractJson(text: string): unknown {
 export async function generatePersonalDmReply(input: {
   text: string;
   fromName: string;
+  history?: DmHistoryTurn[];
 }): Promise<DmReplyResult> {
   const keys = loadLlmKeys();
   const chain = buildProviderChain(keys).slice(0, MAX_PROVIDERS);
 
-  const fallback = fallbackReply(input.text);
+  const fallback = fallbackReply(
+    [input.text, ...(input.history ?? []).map((h) => h.text)].join(" "),
+  );
 
   if (chain.length === 0) {
     return {
@@ -101,10 +143,7 @@ export async function generatePersonalDmReply(input: {
     };
   }
 
-  const langHint = prefersHinglish(input.text)
-    ? "Reply in Hinglish/Hindi only — same style as their message."
-    : "Reply in English unless they mixed Hindi.";
-  const userContent = `From: ${input.fromName}\n${langHint}\nMessage: ${input.text}`;
+  const userContent = buildUserContent(input);
 
   for (const { endpoint, apiKeys } of chain) {
     for (const apiKey of apiKeys.slice(0, 1)) {
@@ -118,7 +157,7 @@ export async function generatePersonalDmReply(input: {
         try {
           const completion = await client.chat.completions.create({
             model,
-            temperature: 0.55,
+            temperature: 0.65,
             response_format: { type: "json_object" },
             messages: [
               { role: "system", content: systemPrompt() },
@@ -130,9 +169,15 @@ export async function generatePersonalDmReply(input: {
           const parsed = DmReplySchema.parse(extractJson(content));
           const confidence = parsed.confidence ?? (parsed.needsHuman ? 0.3 : 0.7);
           const needsHuman = parsed.needsHuman || confidence < 0.45;
-          const reply = needsHuman
+          let reply = needsHuman
             ? fallback
             : parsed.reply.trim() || fallback;
+          // Strip common robotic English CTA if model slips
+          reply = reply
+            .replace(/\s*How can I help you today\??/gi, "")
+            .replace(/\s*How may I assist you\??/gi, "")
+            .trim();
+          if (!reply) reply = fallback;
           return {
             reply,
             needsHuman: needsHuman || reply === fallback,
