@@ -8,7 +8,13 @@ import {
 
 const FALLBACK_EN = "I'm an AI — Deepak will get back to you.";
 const FALLBACK_HI =
-  "Main Deepak ka AI assistant hoon — Deepak jaldi reply karenge.";
+  "Main Deepak ka AI assistant hoon — Deepak jaldi dekh ke batayenge.";
+
+/** Casual ack when they raise a real ops issue in Hinglish (still needs Deepak). */
+const OPS_ACK_HI =
+  "Theek hai bhaiya, samajh gaya — main Deepak ko bata deta hoon, woh check karke aapko batayenge.";
+const OPS_ACK_EN =
+  "Got it — I'll flag this for Deepak, he'll check and get back to you.";
 
 const DmReplySchema = z.object({
   reply: z.string().min(1).max(800),
@@ -34,18 +40,49 @@ const MAX_PROVIDERS = 2;
 function prefersHinglish(text: string): boolean {
   if (/[\u0900-\u097F]/.test(text)) return true;
   const t = text.toLowerCase();
-  return /\b(hai|hain|ho|bhai|bhaiya|ji|kya|kese|kaise|kahan|kab|nahi|nahin|mat|thik|theek|acha|accha|haan|han|hua|hu|hun|aap|mai|main|toh|bt(a|ao)|batao|sunao|okji|ok ji|ram ram|namaste|maal|gaadi|factory|uth(a|aya|ao)|bhej|karo|karna|sab|bas)\b/.test(
+  return /\b(hai|hain|ho|bhai|bhaiya|ji|kya|kese|kaise|kahan|kab|nahi|nahin|mat|thik|theek|acha|accha|haan|han|hua|hu|hun|aap|mai|main|toh|bt(a|ao)|batao|sunao|okji|ok ji|ram ram|namaste|maal|gaadi|factory|uth(a|aya|ao|aya)|bhej|karo|karna|sab|bas|bhadiya|badiya|abhi|tk|tak)\b/.test(
     t,
   );
 }
 
-function fallbackReply(text: string): string {
-  return prefersHinglish(text) ? FALLBACK_HI : FALLBACK_EN;
+function looksLikeOpsIssue(text: string): boolean {
+  const t = text.toLowerCase();
+  return /\b(maal|factory|gaadi|pickup|uth(a|aya|ao)|delivery|payment|bill|invoice|load|vehicle|driver|bhej|nahi utha|nhi utha)\b/.test(
+    t,
+  );
 }
 
-function systemPrompt(): string {
+/** True if reply is mostly English while we expected Hinglish. */
+function isMostlyEnglish(reply: string): boolean {
+  if (/[\u0900-\u097F]/.test(reply)) return false;
+  const t = reply.toLowerCase();
+  const hasHinglish = prefersHinglish(t);
+  const hasEnglishSentence =
+    /\b(i'll|i will|sure|please|check|status|order|shortly|help you|assist|glad|thank you|how can)\b/.test(
+      t,
+    );
+  return hasEnglishSentence && !hasHinglish;
+}
+
+function fallbackReply(text: string, ops: boolean): string {
+  const hi = prefersHinglish(text);
+  if (ops) return hi ? OPS_ACK_HI : OPS_ACK_EN;
+  return hi ? FALLBACK_HI : FALLBACK_EN;
+}
+
+function systemPrompt(hinglishLock: boolean): string {
+  const langBlock = hinglishLock
+    ? `LANGUAGE LOCK (hard rule):
+- The other person is chatting in Hinglish/Hindi.
+- Your "reply" MUST be Hinglish (Roman Hindi) or Hindi — same vibe as them ("bhaiya", "theek hai", "samajh gaya").
+- FORBIDDEN in reply: full English sentences like "Sure, I'll check…", "How can I help you?", "I'll get back to you shortly."
+- Example good: "Ram Ram bhai! Main theek hoon, boliye."
+- Example good for ops: "Arre theek hai bhaiya, main Deepak ko bata deta hoon — woh check karke batayenge."
+- Example BAD: "Sure, I'll check the status of your order…"`
+    : `Language: reply in simple English unless they mix Hindi.`;
+
   return `You chat on WhatsApp as Deepak Mor's AI assistant (India, transport/logistics).
-Sound like a real person texting — short, warm, natural. Not a call-centre bot.
+Sound like a real person texting — short, warm, North-India casual. Not a call-centre bot.
 
 Return ONLY JSON:
 {
@@ -54,23 +91,17 @@ Return ONLY JSON:
   "confidence": 0-1
 }
 
-Language (must follow):
-- Match the OTHER PERSON's latest messages. If they use Hinglish/Hindi, reply ONLY in that same Hinglish/Hindi. Never switch to English mid-chat.
-- Pure English from them → simple English from you.
+${langBlock}
 
-Conversation (must follow):
-- You get recent chat history. CONTINUE the thread — do not restart with a fresh greeting every time.
-- If they already said they are fine / asked how you are, answer briefly and move on. Do NOT ask "kaise ho?" again.
-- Never use robotic lines like: "How can I help you today?", "How may I assist you?", "Is there anything else I can help with?"
-- Prefer natural closers: "bolo", "batao", "haan boliye", "theek hai", or just answer.
-- Greetings only when THEY just greeted (hi / ram ram / namaste). One short greeting, not Namaste + full intro every turn.
+Conversation:
+- Use recent history. CONTINUE the thread — do not restart with Namaste/Hi every message.
+- Don't re-ask "kaise ho?" after they already answered.
+- Never use: "How can I help you today?", "How may I assist you?", "Is there anything else…"
+- Natural closers: "bolo", "batao", "theek hai", or just answer.
 
-Content:
-- Small talk and acknowledgements are fine.
-- For pickup/load/factory/payment details you don't actually know: needsHuman=true and use the language-matched fallback below.
-- Hinglish/Hindi fallback: "${FALLBACK_HI}"
-- English fallback: "${FALLBACK_EN}"
-- Never invent ETAs, prices, addresses, OTPs, or promises.
+Ops / unknown facts:
+- Pickup, factory maal, gaadi, payment, ETAs you don't know → needsHuman=true.
+- Still reply in THEIR language with a short human ack that Deepak will check — do NOT invent status.
 - Plain text only. No markdown.`;
 }
 
@@ -89,19 +120,13 @@ function buildUserContent(input: {
   text: string;
   fromName: string;
   history?: DmHistoryTurn[];
+  hinglishLock: boolean;
 }): string {
-  const corpus = [
-    ...(input.history ?? []).map((h) => h.text),
-    input.text,
-  ].join("\n");
-  const hinglish = prefersHinglish(corpus) || prefersHinglish(input.text);
-  const langHint = hinglish
-    ? "LANGUAGE LOCK: Hinglish/Hindi only. No English sentences."
-    : "LANGUAGE: English is fine.";
-
   const lines: string[] = [
     `From: ${input.fromName}`,
-    langHint,
+    input.hinglishLock
+      ? "HARD LOCK: reply in Hinglish only. Zero English sentences."
+      : "Reply in English unless they mixed Hindi.",
     "Recent chat (oldest → newest):",
   ];
   const hist = (input.history ?? []).slice(-8);
@@ -113,10 +138,16 @@ function buildUserContent(input: {
     }
   }
   lines.push(`Them (latest): ${input.text}`);
-  lines.push(
-    "Write the next reply only — continue naturally from the history above.",
-  );
+  lines.push("Next reply only — continue the chat naturally.");
   return lines.join("\n");
+}
+
+function scrubRobotic(reply: string): string {
+  return reply
+    .replace(/\s*How can I help you(?: today)?\??/gi, "")
+    .replace(/\s*How may I assist you\??/gi, "")
+    .replace(/\s*Is there anything else I can help(?: you)? with\??/gi, "")
+    .trim();
 }
 
 /**
@@ -131,9 +162,14 @@ export async function generatePersonalDmReply(input: {
   const keys = loadLlmKeys();
   const chain = buildProviderChain(keys).slice(0, MAX_PROVIDERS);
 
-  const fallback = fallbackReply(
-    [input.text, ...(input.history ?? []).map((h) => h.text)].join(" "),
-  );
+  const corpus = [
+    input.text,
+    ...(input.history ?? []).map((h) => h.text),
+  ].join("\n");
+  const hinglishLock =
+    prefersHinglish(input.text) || prefersHinglish(corpus);
+  const ops = looksLikeOpsIssue(input.text);
+  const fallback = fallbackReply(corpus, ops);
 
   if (chain.length === 0) {
     return {
@@ -143,7 +179,7 @@ export async function generatePersonalDmReply(input: {
     };
   }
 
-  const userContent = buildUserContent(input);
+  const userContent = buildUserContent({ ...input, hinglishLock });
 
   for (const { endpoint, apiKeys } of chain) {
     for (const apiKey of apiKeys.slice(0, 1)) {
@@ -157,10 +193,10 @@ export async function generatePersonalDmReply(input: {
         try {
           const completion = await client.chat.completions.create({
             model,
-            temperature: 0.65,
+            temperature: 0.55,
             response_format: { type: "json_object" },
             messages: [
-              { role: "system", content: systemPrompt() },
+              { role: "system", content: systemPrompt(hinglishLock) },
               { role: "user", content: userContent },
             ],
           });
@@ -168,16 +204,17 @@ export async function generatePersonalDmReply(input: {
           if (!content) throw new Error("Empty completion");
           const parsed = DmReplySchema.parse(extractJson(content));
           const confidence = parsed.confidence ?? (parsed.needsHuman ? 0.3 : 0.7);
-          const needsHuman = parsed.needsHuman || confidence < 0.45;
+          let needsHuman = parsed.needsHuman || confidence < 0.45 || ops;
           let reply = needsHuman
             ? fallback
-            : parsed.reply.trim() || fallback;
-          // Strip common robotic English CTA if model slips
-          reply = reply
-            .replace(/\s*How can I help you today\??/gi, "")
-            .replace(/\s*How may I assist you\??/gi, "")
-            .trim();
-          if (!reply) reply = fallback;
+            : scrubRobotic(parsed.reply.trim()) || fallback;
+
+          // If model slipped into English under Hinglish lock, force ack/fallback
+          if (hinglishLock && isMostlyEnglish(reply)) {
+            reply = fallback;
+            needsHuman = true;
+          }
+
           return {
             reply,
             needsHuman: needsHuman || reply === fallback,
@@ -202,4 +239,4 @@ export async function generatePersonalDmReply(input: {
   };
 }
 
-export { FALLBACK_EN as FALLBACK_REPLY, FALLBACK_HI };
+export { FALLBACK_EN as FALLBACK_REPLY, FALLBACK_HI, OPS_ACK_HI };
