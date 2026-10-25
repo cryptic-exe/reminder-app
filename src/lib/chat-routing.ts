@@ -19,11 +19,7 @@ export function getOwnerNotifyChatId(): string {
     process.env.OWNER_PHONE_CHAT_ID?.trim() ||
     "";
   if (!raw) return "";
-  if (raw.includes("@")) return raw;
-  const digits = raw.replace(/\D/g, "");
-  if (!digits) return "";
-  const withCc = digits.length === 10 ? `91${digits}` : digits;
-  return `${withCc}@c.us`;
+  return normalizeChatId(raw.includes("@") ? raw : phoneToChatId(raw));
 }
 
 /** Minutes until a personal-DM reply reminder fires (default 60). */
@@ -33,27 +29,65 @@ export function getPersonalReplyDelayMinutes(): number {
   return Math.min(n, 60 * 24 * 7);
 }
 
-export function isGroupChat(chatId: string): boolean {
-  return chatId.endsWith("@g.us");
+function phoneToChatId(raw: string): string {
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  const withCc = digits.length === 10 ? `91${digits}` : digits;
+  return `${withCc}@c.us`;
 }
 
+/**
+ * Normalize WAHA chat ids:
+ * - trim
+ * - `@s.whatsapp.net` → `@c.us`
+ * Keep `@lid` as-is (must reply to the same LID).
+ */
+export function normalizeChatId(chatId: string): string {
+  const id = chatId.trim();
+  if (id.endsWith("@s.whatsapp.net")) {
+    return `${id.slice(0, -"@s.whatsapp.net".length)}@c.us`;
+  }
+  if (!id.includes("@") && /^\d{10,15}$/.test(id)) {
+    return `${id}@c.us`;
+  }
+  return id;
+}
+
+export function isGroupChat(chatId: string): boolean {
+  return normalizeChatId(chatId).endsWith("@g.us");
+}
+
+/**
+ * 1:1 DM — WhatsApp now often sends `@lid` instead of `@c.us`.
+ * Reply using the same id you received.
+ */
 export function isPersonalChat(chatId: string): boolean {
-  return chatId.endsWith("@c.us");
+  const id = normalizeChatId(chatId);
+  return id.endsWith("@c.us") || id.endsWith("@lid");
 }
 
 export function isReminderGroupChat(chatId: string): boolean {
   const group = getReminderGroupChatId();
-  return Boolean(group && chatId === group);
+  if (!group) return false;
+  return normalizeChatId(chatId) === normalizeChatId(group);
 }
 
 /** Skip DMs from your own notify phone (avoid loops). */
 export function isOwnerNotifyChat(chatId: string): boolean {
   const owner = getOwnerNotifyChatId();
-  return Boolean(owner && chatId === owner);
-}
-
-export function normalizeChatId(chatId: string): string {
-  return chatId.trim();
+  if (!owner) return false;
+  const id = normalizeChatId(chatId);
+  if (id === owner) return true;
+  // Same phone digits when both are @c.us
+  const ownerDigits = owner.replace(/@c\.us$/i, "").replace(/\D/g, "");
+  const idDigits = id.replace(/@c\.us$/i, "").replace(/\D/g, "");
+  return Boolean(
+    ownerDigits &&
+      idDigits &&
+      id.endsWith("@c.us") &&
+      owner.endsWith("@c.us") &&
+      ownerDigits === idDigits,
+  );
 }
 
 /** Env WHATSAPP_CHAT_ID still used as default delivery for group-created reminders. */

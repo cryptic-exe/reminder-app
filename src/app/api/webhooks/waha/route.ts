@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { normalizeChatId } from "@/lib/chat-routing";
 import { getWebhookSecret } from "@/lib/env";
 import { routeInboundMessage } from "@/lib/inbound-router";
 
@@ -27,6 +28,34 @@ function extractPayload(body: unknown): Record<string, unknown> | null {
   return p;
 }
 
+/** Prefer payload.from (may be @lid); fall back to chatId / to / _data.Info.Chat */
+function extractChatId(
+  payload: Record<string, unknown>,
+  fromMe: boolean,
+): string {
+  const candidates = [
+    typeof payload.from === "string" ? payload.from : "",
+    typeof payload.chatId === "string" ? payload.chatId : "",
+    fromMe && typeof payload.to === "string" ? payload.to : "",
+  ];
+  const data =
+    payload._data && typeof payload._data === "object"
+      ? (payload._data as Record<string, unknown>)
+      : null;
+  const info =
+    data?.Info && typeof data.Info === "object"
+      ? (data.Info as Record<string, unknown>)
+      : null;
+  if (typeof info?.Chat === "string") candidates.push(info.Chat);
+  if (typeof info?.Sender === "string" && !fromMe) candidates.push(info.Sender);
+
+  for (const raw of candidates) {
+    if (!raw?.trim()) continue;
+    return normalizeChatId(raw);
+  }
+  return "";
+}
+
 export async function POST(request: Request) {
   if (!authorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -39,10 +68,7 @@ export async function POST(request: Request) {
   }
 
   const fromMe = payload.fromMe === true;
-  const from =
-    (typeof payload.from === "string" && payload.from) ||
-    (fromMe && typeof payload.to === "string" && payload.to) ||
-    "";
+  const chatId = extractChatId(payload, fromMe);
   const text =
     (typeof payload.body === "string" && payload.body) ||
     (typeof payload.text === "string" && payload.text) ||
@@ -68,7 +94,7 @@ export async function POST(request: Request) {
   try {
     const result = await routeInboundMessage({
       messageId: id,
-      chatId: from,
+      chatId,
       text,
       fromMe,
       source,
@@ -76,7 +102,7 @@ export async function POST(request: Request) {
       media,
       hasMedia,
     });
-    return NextResponse.json({ ok: true, ...result, fromMe });
+    return NextResponse.json({ ok: true, ...result, fromMe, chatId });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ ok: false, error: message }, { status: 500 });

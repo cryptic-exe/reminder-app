@@ -9,6 +9,7 @@ import { processPersonalDm } from "@/lib/personal-inbox";
 import {
   isPersonalChat,
   isReminderGroupChat,
+  normalizeChatId,
 } from "@/lib/chat-routing";
 import { claimFingerprint, claimMessageId } from "@/lib/inbound-dedupe";
 
@@ -34,7 +35,7 @@ export async function routeInboundMessage(input: {
   media?: RoutedMedia | null;
   hasMedia?: boolean;
 }): Promise<InboundResult> {
-  const chatId = input.chatId.trim();
+  const chatId = normalizeChatId(input.chatId);
   if (!chatId) return { action: "ignored", ignored: true };
 
   const mime = (input.media?.mimetype || "").toLowerCase();

@@ -21,6 +21,7 @@ export type PersonalInboxResult = {
 
 function displayName(chatId: string, pushName?: string | null): string {
   if (pushName?.trim()) return pushName.trim();
+  if (chatId.endsWith("@lid")) return chatId; // hidden WhatsApp id
   const digits = chatId.replace(/@c\.us$/i, "").replace(/\D/g, "");
   if (digits.length >= 10) return `+${digits}`;
   return chatId;

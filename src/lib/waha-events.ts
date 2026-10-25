@@ -1,3 +1,4 @@
+import { normalizeChatId } from "@/lib/chat-routing";
 import { getWahaServerConfig } from "@/lib/env";
 import { routeInboundMessage } from "@/lib/inbound-router";
 
@@ -91,12 +92,13 @@ function extractMessage(data: unknown): {
     (typeof evt.id === "string" && evt.id) ||
     "";
   const fromMe = payload.fromMe === true;
-  const chatId =
+  const rawChat =
     (typeof payload.from === "string" && payload.from) ||
     (typeof (payload as { chatId?: string }).chatId === "string" &&
       (payload as { chatId: string }).chatId) ||
     (fromMe && typeof payload.to === "string" && payload.to) ||
     "";
+  const chatId = rawChat ? normalizeChatId(rawChat) : "";
   const source =
     typeof payload.source === "string" ? payload.source : undefined;
   const media = extractMedia(payload);
