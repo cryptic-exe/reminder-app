@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getCronSecret } from "@/lib/env";
 import { dispatchDueReminders } from "@/lib/dispatch";
 import { pollInboundWhatsApp } from "@/lib/poll-inbound";
+import { processDuePersonalDmReplies } from "@/lib/personal-inbox";
 
 export const maxDuration = 60;
 
@@ -25,7 +26,7 @@ function isAuthorized(request: Request): boolean {
 export async function GET(request: Request) {
   if (!isAuthorized(request)) return unauthorized();
 
-  const [results, inbound] = await Promise.all([
+  const [results, inbound, personalDm] = await Promise.all([
     dispatchDueReminders(),
     pollInboundWhatsApp().catch((err) => {
       console.warn(
@@ -34,12 +35,20 @@ export async function GET(request: Request) {
       );
       return { checked: 0, handled: [] as Array<{ chatId: string; action: string; id?: string }> };
     }),
+    processDuePersonalDmReplies().catch((err) => {
+      console.warn(
+        "[cron] personal DM queue failed:",
+        err instanceof Error ? err.message : err,
+      );
+      return { checked: 0, results: [] };
+    }),
   ]);
 
   return NextResponse.json({
     processed: results.length,
     results,
     inbound,
+    personalDm,
   });
 }
 

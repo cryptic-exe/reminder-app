@@ -2,6 +2,7 @@ import { prisma } from "@/lib/db";
 import { claimFingerprint, claimMessageId } from "@/lib/inbound-dedupe";
 import {
   getOwnerNotifyChatId,
+  getPersonalDmAiDelayMinutes,
   getPersonalReplyDelayMinutes,
   isOwnerNotifyChat,
   isPersonalChat,
@@ -21,7 +22,7 @@ export type PersonalInboxResult = {
 
 function displayName(chatId: string, pushName?: string | null): string {
   if (pushName?.trim()) return pushName.trim();
-  if (chatId.endsWith("@lid")) return chatId; // hidden WhatsApp id
+  if (chatId.endsWith("@lid")) return chatId;
   const digits = chatId.replace(/@c\.us$/i, "").replace(/\D/g, "");
   if (digits.length >= 10) return `+${digits}`;
   return chatId;
@@ -39,10 +40,8 @@ async function ensureOwnerTarget(): Promise<{ id: string; chatId: string } | nul
 }
 
 /**
- * Personal DM on the WAHA-linked number:
- * 1) AI reads the message and replies in-thread
- * 2) If unsure → "I'm an AI — Deepak will get back to you."
- * 3) When human follow-up is needed → reminder on OWNER_NOTIFY_CHAT_ID
+ * Queue a personal DM for delayed AI reply.
+ * AI waits PERSONAL_DM_AI_DELAY_MINUTES (default 5). If Deepak replies first → skip.
  */
 export async function processPersonalDm(input: {
   messageId: string;
@@ -60,8 +59,6 @@ export async function processPersonalDm(input: {
   const text = input.text.trim();
   if (!text) return { action: "ignored-empty", ignored: true };
 
-  // Text-only fingerprint (no chatId): same DM can arrive as @lid and @c.us.
-  // Claim before LLM so concurrent webhook + local WS cannot both reply.
   const textKey = text.toLowerCase().replace(/\s+/g, " ").slice(0, 160);
   if (!(await claimFingerprint(`pdm:${textKey}`))) {
     return { action: "create-dup", ignored: true };
@@ -70,33 +67,101 @@ export async function processPersonalDm(input: {
     return { action: "create-dup", ignored: true };
   }
 
-  const who = displayName(input.chatId, input.pushName);
-  const snippet = text.length > 120 ? `${text.slice(0, 117)}…` : text;
+  const delayMin = getPersonalDmAiDelayMinutes();
+  const receivedAt = new Date();
+  const replyAfter = new Date(receivedAt.getTime() + delayMin * 60_000);
 
-  // Recent turns so the bot continues the chat instead of restarting every message
-  const history = await fetchChatMessages(input.chatId, 12)
+  const row = await prisma.personalDmQueue.create({
+    data: {
+      messageId: input.messageId,
+      chatId: input.chatId,
+      text,
+      pushName: input.pushName?.trim() || null,
+      receivedAt,
+      replyAfter,
+      status: "pending",
+    },
+  });
+
+  return {
+    action: "personal-ai-queued",
+    id: row.id,
+  };
+}
+
+async function deepakAlreadyReplied(
+  chatId: string,
+  after: Date,
+): Promise<boolean> {
+  const msgs = await fetchChatMessages(chatId, 30).catch(() => []);
+  const afterSec = Math.floor(after.getTime() / 1000) - 5;
+  return msgs.some(
+    (m) =>
+      m.fromMe &&
+      m.body.trim() &&
+      m.timestamp >= afterSec &&
+      // Ignore our own AI/owner-notify style lines if timestamp clock skew
+      !m.body.startsWith("✅ AI replied") &&
+      !m.body.startsWith("🤝 Needs you"),
+  );
+}
+
+async function sendAiReplyForQueueItem(item: {
+  id: string;
+  chatId: string;
+  text: string;
+  pushName: string | null;
+  receivedAt: Date;
+}): Promise<PersonalInboxResult> {
+  const who = displayName(item.chatId, item.pushName);
+  const snippet =
+    item.text.length > 120 ? `${item.text.slice(0, 117)}…` : item.text;
+
+  const history = await fetchChatMessages(item.chatId, 16)
     .then((msgs) =>
       [...msgs]
         .reverse()
         .filter((m) => m.body.trim())
-        .filter((m) => m.body.trim() !== text)
+        .filter((m) => m.body.trim() !== item.text)
         .slice(-8)
         .map((m) => ({ fromMe: m.fromMe, text: m.body.trim() })),
     )
     .catch(() => [] as Array<{ fromMe: boolean; text: string }>);
 
-  const ai = await generatePersonalDmReply({ text, fromName: who, history });
+  // Opening = little/no prior outbound from this number in recent history
+  const priorFromUs = history.some((h) => h.fromMe);
+  const isOpening = !priorFromUs;
 
-  // Reply in the same personal chat (acting on Deepak's linked number)
-  await sendWhatsAppText(ai.reply, input.chatId).catch((err) => {
+  const ai = await generatePersonalDmReply({
+    text: item.text,
+    fromName: who,
+    history,
+    isOpening,
+  });
+
+  await sendWhatsAppText(ai.reply, item.chatId).catch((err) => {
     console.warn(
       "[personal-inbox] reply send failed:",
       err instanceof Error ? err.message : err,
     );
   });
 
+  await prisma.personalDmQueue.update({
+    where: { id: item.id },
+    data: { status: "replied" },
+  });
+
+  // Collapse other pending items in this chat (one AI turn is enough)
+  await prisma.personalDmQueue.updateMany({
+    where: {
+      chatId: item.chatId,
+      status: "pending",
+      id: { not: item.id },
+    },
+    data: { status: "skipped" },
+  });
+
   if (!ai.needsHuman) {
-    // Optional light notify — AI handled it
     const ownerChat = getOwnerNotifyChatId();
     if (ownerChat) {
       await sendWhatsAppText(
@@ -106,16 +171,17 @@ export async function processPersonalDm(input: {
     }
     return {
       action: "personal-ai-reply",
+      id: item.id,
       reply: ai.reply,
       needsHuman: false,
     };
   }
 
-  // Needs Deepak — queue reminder on personal phone
   const owner = await ensureOwnerTarget();
   if (!owner) {
     return {
       action: "personal-ai-fallback",
+      id: item.id,
       reply: ai.reply,
       needsHuman: true,
     };
@@ -128,12 +194,12 @@ export async function processPersonalDm(input: {
       title: `Reply to ${who}: ${snippet}`,
       body: [
         `AI could not fully answer — follow up needed.`,
-        `From: ${who} (${input.chatId})`,
-        `Message: ${text}`,
+        `From: ${who} (${item.chatId})`,
+        `Message: ${item.text}`,
         `AI said: ${ai.reply}`,
       ].join("\n"),
       dueAt,
-      rawInput: `personal-dm: ${text}`,
+      rawInput: `personal-dm: ${item.text}`,
       status: "pending",
       chatTargetId: owner.id,
       recurrenceType: "none",
@@ -153,4 +219,68 @@ export async function processPersonalDm(input: {
     reply: ai.reply,
     needsHuman: true,
   };
+}
+
+/**
+ * Cron: after the delay window, AI replies only if Deepak hasn't answered yet.
+ */
+export async function processDuePersonalDmReplies(): Promise<{
+  checked: number;
+  results: PersonalInboxResult[];
+}> {
+  const now = new Date();
+  const due = await prisma.personalDmQueue.findMany({
+    where: { status: "pending", replyAfter: { lte: now } },
+    orderBy: { replyAfter: "asc" },
+    take: 20,
+  });
+
+  const results: PersonalInboxResult[] = [];
+  const seenChats = new Set<string>();
+
+  for (const item of due) {
+    if (seenChats.has(item.chatId)) {
+      await prisma.personalDmQueue.update({
+        where: { id: item.id },
+        data: { status: "skipped" },
+      });
+      results.push({ action: "personal-ai-skipped-batch", id: item.id, ignored: true });
+      continue;
+    }
+    seenChats.add(item.chatId);
+
+    try {
+      if (await deepakAlreadyReplied(item.chatId, item.receivedAt)) {
+        await prisma.personalDmQueue.update({
+          where: { id: item.id },
+          data: { status: "skipped" },
+        });
+        await prisma.personalDmQueue.updateMany({
+          where: { chatId: item.chatId, status: "pending" },
+          data: { status: "skipped" },
+        });
+        results.push({
+          action: "personal-ai-skipped-human",
+          id: item.id,
+          ignored: true,
+        });
+        continue;
+      }
+
+      const result = await sendAiReplyForQueueItem(item);
+      results.push(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await prisma.personalDmQueue
+        .update({
+          where: { id: item.id },
+          data: { status: "failed", lastError: message.slice(0, 500) },
+        })
+        .catch(() => undefined);
+      results.push({ action: "personal-ai-failed", id: item.id });
+      console.warn("[personal-inbox] due reply failed:", message);
+    }
+  }
+
+  return { checked: due.length, results };
 }

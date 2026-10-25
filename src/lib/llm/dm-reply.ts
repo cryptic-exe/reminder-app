@@ -70,19 +70,29 @@ function fallbackReply(text: string, ops: boolean): string {
   return hi ? FALLBACK_HI : FALLBACK_EN;
 }
 
-function systemPrompt(hinglishLock: boolean): string {
+function systemPrompt(hinglishLock: boolean, isOpening: boolean): string {
   const langBlock = hinglishLock
     ? `LANGUAGE LOCK (hard rule):
 - The other person is chatting in Hinglish/Hindi.
 - Your "reply" MUST be Hinglish (Roman Hindi) or Hindi — same vibe as them ("bhaiya", "theek hai", "samajh gaya").
 - FORBIDDEN in reply: full English sentences like "Sure, I'll check…", "How can I help you?", "I'll get back to you shortly."
-- Example good: "Ram Ram bhai! Main theek hoon, boliye."
+- Example good: "Ram Ram bhai! Main Deepak ka AI assistant hoon — boliye."
 - Example good for ops: "Arre theek hai bhaiya, main Deepak ko bata deta hoon — woh check karke batayenge."
 - Example BAD: "Sure, I'll check the status of your order…"`
     : `Language: reply in simple English unless they mix Hindi.`;
 
+  const openingBlock = isOpening
+    ? hinglishLock
+      ? `OPENING (required): Clearly say you are Deepak's AI assistant, not Deepak himself.
+Example: "Ram Ram bhai! Main Deepak ka AI assistant hoon — Deepak busy hon toh main madad karta hoon. Boliye?"
+Do NOT pretend to be Deepak.`
+      : `OPENING (required): Clearly say you are Deepak's AI assistant, not Deepak.
+Example: "Hi — I'm Deepak's AI assistant (not Deepak). How can I help?"
+Do NOT pretend to be Deepak.`
+    : `Identity: You may already have introduced yourself. Don't repeat a long intro every turn; stay clearly the assistant if asked.`;
+
   return `You chat on WhatsApp as Deepak Mor's AI assistant (India, transport/logistics).
-Sound like a real person texting — short, warm, North-India casual. Not a call-centre bot.
+You are NOT Deepak — you assist for him. Sound warm and human, short WhatsApp style.
 
 Return ONLY JSON:
 {
@@ -90,6 +100,8 @@ Return ONLY JSON:
   "needsHuman": true/false,
   "confidence": 0-1
 }
+
+${openingBlock}
 
 ${langBlock}
 
@@ -121,9 +133,13 @@ function buildUserContent(input: {
   fromName: string;
   history?: DmHistoryTurn[];
   hinglishLock: boolean;
+  isOpening: boolean;
 }): string {
   const lines: string[] = [
     `From: ${input.fromName}`,
+    input.isOpening
+      ? "OPENING TURN: introduce as Deepak's AI (not Deepak)."
+      : "Continuing thread — no need to re-introduce unless asked.",
     input.hinglishLock
       ? "HARD LOCK: reply in Hinglish only. Zero English sentences."
       : "Reply in English unless they mixed Hindi.",
@@ -140,6 +156,22 @@ function buildUserContent(input: {
   lines.push(`Them (latest): ${input.text}`);
   lines.push("Next reply only — continue the chat naturally.");
   return lines.join("\n");
+}
+
+function ensureAiDisclosure(reply: string, hinglish: boolean): string {
+  const lower = reply.toLowerCase();
+  if (
+    lower.includes("ai assistant") ||
+    lower.includes("ai hoon") ||
+    lower.includes("ka ai") ||
+    /deepak ka ai/i.test(reply)
+  ) {
+    return reply;
+  }
+  const prefix = hinglish
+    ? "Main Deepak ka AI assistant hoon (Deepak nahi). "
+    : "I'm Deepak's AI assistant (not Deepak). ";
+  return `${prefix}${reply}`.trim();
 }
 
 function scrubRobotic(reply: string): string {

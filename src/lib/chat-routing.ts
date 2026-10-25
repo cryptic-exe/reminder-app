@@ -22,11 +22,21 @@ export function getOwnerNotifyChatId(): string {
   return normalizeChatId(raw.includes("@") ? raw : phoneToChatId(raw));
 }
 
-/** Minutes until a personal-DM reply reminder fires (default 60). */
+/** Minutes until a personal-DM reply reminder fires for Deepak (default 60). */
 export function getPersonalReplyDelayMinutes(): number {
   const n = Number(process.env.PERSONAL_REPLY_DELAY_MINUTES || 60);
   if (!Number.isFinite(n) || n < 1) return 60;
   return Math.min(n, 60 * 24 * 7);
+}
+
+/**
+ * How long to wait before AI answers a personal DM.
+ * If Deepak replies in this window, AI stays silent (default 5).
+ */
+export function getPersonalDmAiDelayMinutes(): number {
+  const n = Number(process.env.PERSONAL_DM_AI_DELAY_MINUTES || 5);
+  if (!Number.isFinite(n) || n < 1) return 5;
+  return Math.min(n, 60);
 }
 
 function phoneToChatId(raw: string): string {
