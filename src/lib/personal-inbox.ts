@@ -2,7 +2,6 @@ import { prisma } from "@/lib/db";
 import { claimFingerprint, claimMessageId } from "@/lib/inbound-dedupe";
 import {
   getOwnerNotifyChatId,
-  getPersonalDmAiDelayMinutes,
   getPersonalReplyDelayMinutes,
   isOwnerNotifyChat,
   isPersonalChat,
@@ -20,12 +19,18 @@ export type PersonalInboxResult = {
   needsHuman?: boolean;
 };
 
+const OWNER_MODE_TTL_MS = 12 * 60 * 60_000;
+
 function displayName(chatId: string, pushName?: string | null): string {
   if (pushName?.trim()) return pushName.trim();
   if (chatId.endsWith("@lid")) return chatId;
   const digits = chatId.replace(/@c\.us$/i, "").replace(/\D/g, "");
   if (digits.length >= 10) return `+${digits}`;
   return chatId;
+}
+
+function shortRef(id: string): string {
+  return id.slice(-6);
 }
 
 async function ensureOwnerTarget(): Promise<{ id: string; chatId: string } | null> {
@@ -39,79 +44,37 @@ async function ensureOwnerTarget(): Promise<{ id: string; chatId: string } | nul
   return { id: created.id, chatId };
 }
 
-/**
- * Queue a personal DM for delayed AI reply.
- * AI waits PERSONAL_DM_AI_DELAY_MINUTES (default 5). If Deepak replies first → skip.
- */
-export async function processPersonalDm(input: {
-  messageId: string;
-  chatId: string;
-  text: string;
-  pushName?: string | null;
-}): Promise<PersonalInboxResult> {
-  if (!isPersonalChat(input.chatId)) {
-    return { action: "ignored", ignored: true };
-  }
-  if (isOwnerNotifyChat(input.chatId)) {
-    return { action: "ignored-owner", ignored: true };
-  }
-
-  const text = input.text.trim();
-  if (!text) return { action: "ignored-empty", ignored: true };
-
-  const textKey = text.toLowerCase().replace(/\s+/g, " ").slice(0, 160);
-  if (!(await claimFingerprint(`pdm:${textKey}`))) {
-    return { action: "create-dup", ignored: true };
-  }
-  if (!(await claimMessageId(input.messageId))) {
-    return { action: "create-dup", ignored: true };
-  }
-
-  const delayMin = getPersonalDmAiDelayMinutes();
-  const receivedAt = new Date();
-  const replyAfter = new Date(receivedAt.getTime() + delayMin * 60_000);
-
-  const row = await prisma.personalDmQueue.create({
-    data: {
-      messageId: input.messageId,
-      chatId: input.chatId,
-      text,
-      pushName: input.pushName?.trim() || null,
-      receivedAt,
-      replyAfter,
-      status: "pending",
-    },
-  });
-
-  return {
-    action: "personal-ai-queued",
-    id: row.id,
-  };
-}
-
-async function deepakAlreadyReplied(
+async function getSessionMode(
   chatId: string,
-  after: Date,
-): Promise<boolean> {
-  const msgs = await fetchChatMessages(chatId, 30).catch(() => []);
-  const afterSec = Math.floor(after.getTime() / 1000) - 5;
-  return msgs.some(
-    (m) =>
-      m.fromMe &&
-      m.body.trim() &&
-      m.timestamp >= afterSec &&
-      // Ignore our own AI/owner-notify style lines if timestamp clock skew
-      !m.body.startsWith("✅ AI replied") &&
-      !m.body.startsWith("🤝 Needs you"),
-  );
+): Promise<"ai" | "owner" | "ask" | null> {
+  const row = await prisma.personalDmSession.findUnique({ where: { chatId } });
+  if (!row) return null;
+  if (row.mode === "owner") {
+    const age = Date.now() - row.updatedAt.getTime();
+    if (age > OWNER_MODE_TTL_MS) return null;
+  }
+  if (row.mode === "ai" || row.mode === "owner" || row.mode === "ask") {
+    return row.mode;
+  }
+  return null;
 }
 
-async function sendAiReplyForQueueItem(item: {
+async function setSessionMode(
+  chatId: string,
+  mode: "ai" | "owner" | "ask",
+): Promise<void> {
+  await prisma.personalDmSession.upsert({
+    where: { chatId },
+    create: { chatId, mode },
+    update: { mode },
+  });
+}
+
+async function sendAiReplyForItem(item: {
   id: string;
   chatId: string;
   text: string;
   pushName: string | null;
-  receivedAt: Date;
 }): Promise<PersonalInboxResult> {
   const who = displayName(item.chatId, item.pushName);
   const snippet =
@@ -128,7 +91,6 @@ async function sendAiReplyForQueueItem(item: {
     )
     .catch(() => [] as Array<{ fromMe: boolean; text: string }>);
 
-  // Opening = little/no prior outbound from this number in recent history
   const priorFromUs = history.some((h) => h.fromMe);
   const isOpening = !priorFromUs;
 
@@ -150,137 +112,304 @@ async function sendAiReplyForQueueItem(item: {
     where: { id: item.id },
     data: { status: "replied" },
   });
-
-  // Collapse other pending items in this chat (one AI turn is enough)
   await prisma.personalDmQueue.updateMany({
     where: {
       chatId: item.chatId,
-      status: "pending",
+      status: "awaiting_owner",
       id: { not: item.id },
     },
     data: { status: "skipped" },
   });
+  await setSessionMode(item.chatId, "ai");
 
-  if (!ai.needsHuman) {
-    const ownerChat = getOwnerNotifyChatId();
-    if (ownerChat) {
+  const ownerChat = getOwnerNotifyChatId();
+  if (ownerChat) {
+    await sendWhatsAppText(
+      `✅ AI → ${who}\nThem: ${snippet}\nBot: ${ai.reply.slice(0, 160)}\n(AI ON for this chat. Stop: AI OFF ${shortRef(item.id)})`,
+      ownerChat,
+    ).catch(() => undefined);
+  }
+
+  if (ai.needsHuman) {
+    const owner = await ensureOwnerTarget();
+    if (owner) {
+      const delayMin = getPersonalReplyDelayMinutes();
+      const dueAt = new Date(Date.now() + delayMin * 60_000);
+      const reminder = await prisma.reminder.create({
+        data: {
+          title: `Reply to ${who}: ${snippet}`,
+          body: [
+            `AI could not fully answer — follow up needed.`,
+            `From: ${who} (${item.chatId})`,
+            `Message: ${item.text}`,
+            `AI said: ${ai.reply}`,
+          ].join("\n"),
+          dueAt,
+          rawInput: `personal-dm: ${item.text}`,
+          status: "pending",
+          chatTargetId: owner.id,
+          recurrenceType: "none",
+          recurrenceWeekdays: [],
+        },
+      });
+      const dueLabel = formatInUserTz(dueAt.toISOString(), getUserTimezone());
       await sendWhatsAppText(
-        `✅ AI replied to ${who}\nThem: ${snippet}\nBot: ${ai.reply.slice(0, 160)}`,
-        ownerChat,
+        `🤝 Needs you\n${who}: ${snippet}\nAI: ${ai.reply}\nRemind: ${dueLabel}\nid:${reminder.id.slice(-6)}`,
+        owner.chatId,
       ).catch(() => undefined);
+      return {
+        action: "personal-ai-needs-human",
+        id: reminder.id,
+        reply: ai.reply,
+        needsHuman: true,
+      };
     }
-    return {
-      action: "personal-ai-reply",
-      id: item.id,
-      reply: ai.reply,
-      needsHuman: false,
-    };
   }
-
-  const owner = await ensureOwnerTarget();
-  if (!owner) {
-    return {
-      action: "personal-ai-fallback",
-      id: item.id,
-      reply: ai.reply,
-      needsHuman: true,
-    };
-  }
-
-  const delayMin = getPersonalReplyDelayMinutes();
-  const dueAt = new Date(Date.now() + delayMin * 60_000);
-  const reminder = await prisma.reminder.create({
-    data: {
-      title: `Reply to ${who}: ${snippet}`,
-      body: [
-        `AI could not fully answer — follow up needed.`,
-        `From: ${who} (${item.chatId})`,
-        `Message: ${item.text}`,
-        `AI said: ${ai.reply}`,
-      ].join("\n"),
-      dueAt,
-      rawInput: `personal-dm: ${item.text}`,
-      status: "pending",
-      chatTargetId: owner.id,
-      recurrenceType: "none",
-      recurrenceWeekdays: [],
-    },
-  });
-
-  const dueLabel = formatInUserTz(dueAt.toISOString(), getUserTimezone());
-  await sendWhatsAppText(
-    `🤝 Needs you\n${who}: ${snippet}\nAI: ${ai.reply}\nRemind: ${dueLabel}\nid:${reminder.id.slice(-6)}`,
-    owner.chatId,
-  ).catch(() => undefined);
 
   return {
-    action: "personal-ai-needs-human",
-    id: reminder.id,
+    action: "personal-ai-reply",
+    id: item.id,
     reply: ai.reply,
-    needsHuman: true,
+    needsHuman: ai.needsHuman,
   };
 }
 
+async function askOwnerToDecide(item: {
+  id: string;
+  chatId: string;
+  text: string;
+  pushName: string | null;
+}): Promise<PersonalInboxResult> {
+  const ownerChat = getOwnerNotifyChatId();
+  if (!ownerChat) {
+    return { action: "personal-no-owner", id: item.id, ignored: true };
+  }
+
+  const who = displayName(item.chatId, item.pushName);
+  const snippet =
+    item.text.length > 200 ? `${item.text.slice(0, 197)}…` : item.text;
+  const ref = shortRef(item.id);
+
+  await setSessionMode(item.chatId, "ask");
+  await sendWhatsAppText(
+    [
+      `📩 ${who}`,
+      snippet,
+      ``,
+      `AI is conversation le?`,
+      `YES ${ref} — AI baat continue karega`,
+      `NO ${ref} — aap khud reply karo`,
+    ].join("\n"),
+    ownerChat,
+  ).catch((err) => {
+    console.warn(
+      "[personal-inbox] owner ask failed:",
+      err instanceof Error ? err.message : err,
+    );
+  });
+
+  return { action: "personal-awaiting-owner", id: item.id };
+}
+
 /**
- * Cron: after the delay window, AI replies only if Deepak hasn't answered yet.
+ * Personal DM on WAHA-linked number:
+ * - If chat is AI-mode → reply now
+ * - If chat is owner-mode → stay quiet (owner handles)
+ * - Else → ask owner YES/NO whether AI should take over
  */
+export async function processPersonalDm(input: {
+  messageId: string;
+  chatId: string;
+  text: string;
+  pushName?: string | null;
+}): Promise<PersonalInboxResult> {
+  if (!isPersonalChat(input.chatId)) {
+    return { action: "ignored", ignored: true };
+  }
+
+  // Owner phone messages are handoff decisions, not customer DMs
+  if (isOwnerNotifyChat(input.chatId)) {
+    return processOwnerHandoffDecision({
+      messageId: input.messageId,
+      text: input.text,
+    });
+  }
+
+  const text = input.text.trim();
+  if (!text) return { action: "ignored-empty", ignored: true };
+
+  const textKey = text.toLowerCase().replace(/\s+/g, " ").slice(0, 160);
+  if (!(await claimFingerprint(`pdm:${textKey}`))) {
+    return { action: "create-dup", ignored: true };
+  }
+  if (!(await claimMessageId(input.messageId))) {
+    return { action: "create-dup", ignored: true };
+  }
+
+  const mode = await getSessionMode(input.chatId);
+
+  if (mode === "owner") {
+    const ownerChat = getOwnerNotifyChatId();
+    if (ownerChat) {
+      const who = displayName(input.chatId, input.pushName);
+      await sendWhatsAppText(
+        `📩 ${who} (aap handle kar rahe ho)\n${text.slice(0, 200)}`,
+        ownerChat,
+      ).catch(() => undefined);
+    }
+    return { action: "personal-owner-mode", ignored: true };
+  }
+
+  const row = await prisma.personalDmQueue.create({
+    data: {
+      messageId: input.messageId,
+      chatId: input.chatId,
+      text,
+      pushName: input.pushName?.trim() || null,
+      receivedAt: new Date(),
+      replyAfter: new Date(),
+      status: mode === "ai" ? "awaiting_owner" : "awaiting_owner",
+    },
+  });
+
+  if (mode === "ai") {
+    return sendAiReplyForItem(row);
+  }
+
+  return askOwnerToDecide(row);
+}
+
+function parseOwnerDecision(text: string): {
+  decision: "yes" | "no" | "ai_off" | null;
+  ref: string | null;
+} {
+  const t = text.trim().toLowerCase().replace(/\s+/g, " ");
+  const refMatch = t.match(/\b([a-z0-9]{4,8})\s*$/i);
+  const ref = refMatch?.[1] && !/^(yes|no|haan|han|na|ai|off|on)$/i.test(refMatch[1])
+    ? refMatch[1]
+    : null;
+
+  if (/^(ai\s*off|stop\s*ai)\b/.test(t)) {
+    return { decision: "ai_off", ref };
+  }
+  if (
+    /^(yes|y|haan|han|ha|ai(\s+yes)?|ok\s*ai)\b/.test(t) ||
+    /^yes\b/.test(t)
+  ) {
+    return { decision: "yes", ref };
+  }
+  if (/^(no|n|na|nahi|owner|main|me)\b/.test(t)) {
+    return { decision: "no", ref };
+  }
+  return { decision: null, ref: null };
+}
+
+async function findQueueForDecision(ref: string | null) {
+  if (ref) {
+    const matches = await prisma.personalDmQueue.findMany({
+      where: {
+        status: "awaiting_owner",
+        id: { endsWith: ref },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+    });
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      return matches.find((m) => m.id.endsWith(ref)) ?? matches[0];
+    }
+  }
+  return prisma.personalDmQueue.findFirst({
+    where: { status: "awaiting_owner" },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+/**
+ * Owner (NOTIFY phone) replies YES/NO to hand conversation to AI.
+ */
+export async function processOwnerHandoffDecision(input: {
+  messageId: string;
+  text: string;
+}): Promise<PersonalInboxResult> {
+  const text = input.text.trim();
+  if (!text) return { action: "ignored-empty", ignored: true };
+
+  if (!(await claimMessageId(input.messageId))) {
+    return { action: "create-dup", ignored: true };
+  }
+
+  const { decision, ref } = parseOwnerDecision(text);
+  const ownerChat = getOwnerNotifyChatId();
+
+  if (!decision) {
+    return { action: "owner-ignored", ignored: true };
+  }
+
+  if (decision === "ai_off") {
+    const item = await findQueueForDecision(ref);
+    const chatId = item?.chatId;
+    if (chatId) {
+      await setSessionMode(chatId, "owner");
+      await prisma.personalDmQueue.updateMany({
+        where: { chatId, status: "awaiting_owner" },
+        data: { status: "skipped" },
+      });
+    } else {
+      // Turn off AI for most recent AI session
+      const recent = await prisma.personalDmSession.findFirst({
+        where: { mode: "ai" },
+        orderBy: { updatedAt: "desc" },
+      });
+      if (recent) await setSessionMode(recent.chatId, "owner");
+    }
+    if (ownerChat) {
+      await sendWhatsAppText(
+        "OK — AI OFF. Aap khud reply karo. Phir se AI ke liye naya DM aaye to YES bhejna.",
+        ownerChat,
+      ).catch(() => undefined);
+    }
+    return { action: "personal-ai-off", id: chatId };
+  }
+
+  const item = await findQueueForDecision(ref);
+  if (!item) {
+    if (ownerChat) {
+      await sendWhatsAppText(
+        "Koi pending DM nahi mili. Naya message aaye to YES/NO bhejna.",
+        ownerChat,
+      ).catch(() => undefined);
+    }
+    return { action: "personal-no-pending", ignored: true };
+  }
+
+  if (decision === "no") {
+    await setSessionMode(item.chatId, "owner");
+    await prisma.personalDmQueue.update({
+      where: { id: item.id },
+      data: { status: "skipped" },
+    });
+    await prisma.personalDmQueue.updateMany({
+      where: { chatId: item.chatId, status: "awaiting_owner" },
+      data: { status: "skipped" },
+    });
+    if (ownerChat) {
+      await sendWhatsAppText(
+        `OK — aap reply karo (${displayName(item.chatId, item.pushName)}). AI quiet rahega.`,
+        ownerChat,
+      ).catch(() => undefined);
+    }
+    return { action: "personal-owner-will-reply", id: item.id };
+  }
+
+  // YES — AI takes over
+  return sendAiReplyForItem(item);
+}
+
+/** @deprecated Delay path removed; kept so cron/webhook imports don't break. */
 export async function processDuePersonalDmReplies(): Promise<{
   checked: number;
   results: PersonalInboxResult[];
 }> {
-  const now = new Date();
-  const due = await prisma.personalDmQueue.findMany({
-    where: { status: "pending", replyAfter: { lte: now } },
-    orderBy: { replyAfter: "asc" },
-    take: 20,
-  });
-
-  const results: PersonalInboxResult[] = [];
-  const seenChats = new Set<string>();
-
-  for (const item of due) {
-    if (seenChats.has(item.chatId)) {
-      await prisma.personalDmQueue.update({
-        where: { id: item.id },
-        data: { status: "skipped" },
-      });
-      results.push({ action: "personal-ai-skipped-batch", id: item.id, ignored: true });
-      continue;
-    }
-    seenChats.add(item.chatId);
-
-    try {
-      if (await deepakAlreadyReplied(item.chatId, item.receivedAt)) {
-        await prisma.personalDmQueue.update({
-          where: { id: item.id },
-          data: { status: "skipped" },
-        });
-        await prisma.personalDmQueue.updateMany({
-          where: { chatId: item.chatId, status: "pending" },
-          data: { status: "skipped" },
-        });
-        results.push({
-          action: "personal-ai-skipped-human",
-          id: item.id,
-          ignored: true,
-        });
-        continue;
-      }
-
-      const result = await sendAiReplyForQueueItem(item);
-      results.push(result);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await prisma.personalDmQueue
-        .update({
-          where: { id: item.id },
-          data: { status: "failed", lastError: message.slice(0, 500) },
-        })
-        .catch(() => undefined);
-      results.push({ action: "personal-ai-failed", id: item.id });
-      console.warn("[personal-inbox] due reply failed:", message);
-    }
-  }
-
-  return { checked: due.length, results };
+  return { checked: 0, results: [] };
 }

@@ -177,8 +177,8 @@ export function SettingsApp() {
         <p className="mt-2 text-xs text-zinc-500">
           <strong>Reminders group only:</strong> “remind…”, snooze, list, voice
           notes. <strong>Personal DMs</strong> to the WAHA-linked number get an
-          AI reply; if unsure it says Deepak will get back, and you’re reminded
-          on OWNER_NOTIFY_CHAT_ID.
+          ask on OWNER_NOTIFY_CHAT_ID (YES = AI takes the chat, NO = you reply).
+          Opening AI replies say it’s an assistant, not you.
         </p>
       </section>
     </div>

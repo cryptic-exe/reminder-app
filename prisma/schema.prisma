@@ -76,7 +76,7 @@ model InboundClaim {
   @@index([createdAt])
 }
 
-/// Personal DMs wait before AI replies so Deepak can answer first.
+/// Personal DM waiting for owner YES/NO (AI take over vs owner replies).
 model PersonalDmQueue {
   id         String   @id @default(cuid())
   messageId  String   @unique
@@ -84,14 +84,23 @@ model PersonalDmQueue {
   text       String
   pushName   String?
   receivedAt DateTime @default(now())
-  /// Earliest time AI may reply (usually receivedAt + 5 minutes)
-  replyAfter DateTime
-  /// pending | replied | skipped | failed
-  status     String   @default("pending")
+  /// Kept for schema compat; unused (no delay — owner decides).
+  replyAfter DateTime @default(now())
+  /// awaiting_owner | replied | skipped | failed
+  status     String   @default("awaiting_owner")
   lastError  String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
   @@index([status, replyAfter])
   @@index([chatId, status])
+}
+
+/// Per-chat handoff: ai = AI continues; owner = Deepak handles; ask = waiting decision.
+model PersonalDmSession {
+  chatId    String   @id
+  /// ai | owner | ask
+  mode      String   @default("ask")
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
 }

@@ -72,8 +72,11 @@ export function isBotEcho(text: string): boolean {
     t.startsWith("No upcoming reminders") ||
     t.startsWith("I'm an AI") ||
     t.startsWith("Main Deepak ka AI") ||
-    t.startsWith("✅ AI replied") ||
-    t.startsWith("🤝 Needs you")
+    t.startsWith("✅ AI") ||
+    t.startsWith("🤝 Needs you") ||
+    t.startsWith("📩 ") ||
+    t.startsWith("OK —") ||
+    t.startsWith("AI is conversation")
   );
 }
 
