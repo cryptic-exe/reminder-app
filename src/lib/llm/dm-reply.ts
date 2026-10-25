@@ -190,9 +190,11 @@ export async function generatePersonalDmReply(input: {
   text: string;
   fromName: string;
   history?: DmHistoryTurn[];
+  isOpening?: boolean;
 }): Promise<DmReplyResult> {
   const keys = loadLlmKeys();
   const chain = buildProviderChain(keys).slice(0, MAX_PROVIDERS);
+  const isOpening = input.isOpening === true;
 
   const corpus = [
     input.text,
@@ -205,13 +207,19 @@ export async function generatePersonalDmReply(input: {
 
   if (chain.length === 0) {
     return {
-      reply: fallback,
+      reply: isOpening
+        ? ensureAiDisclosure(fallback, hinglishLock)
+        : fallback,
       needsHuman: true,
       used: { provider: "local", model: "fallback" },
     };
   }
 
-  const userContent = buildUserContent({ ...input, hinglishLock });
+  const userContent = buildUserContent({
+    ...input,
+    hinglishLock,
+    isOpening,
+  });
 
   for (const { endpoint, apiKeys } of chain) {
     for (const apiKey of apiKeys.slice(0, 1)) {
@@ -228,7 +236,10 @@ export async function generatePersonalDmReply(input: {
             temperature: 0.55,
             response_format: { type: "json_object" },
             messages: [
-              { role: "system", content: systemPrompt(hinglishLock) },
+              {
+                role: "system",
+                content: systemPrompt(hinglishLock, isOpening),
+              },
               { role: "user", content: userContent },
             ],
           });
@@ -241,10 +252,12 @@ export async function generatePersonalDmReply(input: {
             ? fallback
             : scrubRobotic(parsed.reply.trim()) || fallback;
 
-          // If model slipped into English under Hinglish lock, force ack/fallback
           if (hinglishLock && isMostlyEnglish(reply)) {
             reply = fallback;
             needsHuman = true;
+          }
+          if (isOpening) {
+            reply = ensureAiDisclosure(reply, hinglishLock);
           }
 
           return {
@@ -265,7 +278,9 @@ export async function generatePersonalDmReply(input: {
   }
 
   return {
-    reply: fallback,
+    reply: isOpening
+      ? ensureAiDisclosure(fallback, hinglishLock)
+      : fallback,
     needsHuman: true,
     used: { provider: "local", model: "fallback" },
   };
