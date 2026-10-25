@@ -61,6 +61,13 @@ export async function routeInboundMessage(input: {
     if (!looksLikeUserCommand(text)) {
       return { action: "ignored", ignored: true };
     }
+    // Claim before create — webhook can fire message + retries concurrently
+    if (!(await claimMessageId(input.messageId))) {
+      return { action: "create-dup", ignored: true };
+    }
+    if (!(await claimFingerprint(`group:${chatId}:${text}`))) {
+      return { action: "create-dup", ignored: true };
+    }
     return processInboundText(text, chatId);
   }
 

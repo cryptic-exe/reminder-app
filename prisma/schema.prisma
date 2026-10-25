@@ -67,3 +67,11 @@ model Reminder {
   @@index([status, dueAt])
   @@index([chatTargetId])
 }
+
+/// Atomic inbound dedupe across Vercel serverless instances (/tmp is not shared).
+model InboundClaim {
+  key       String   @id
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
