@@ -22,6 +22,12 @@ export function getOwnerNotifyChatId(): string {
   return normalizeChatId(raw.includes("@") ? raw : phoneToChatId(raw));
 }
 
+/** Optional explicit LID for owner phone (GOWS often sends @lid). */
+export function getOwnerNotifyLidFromEnv(): string {
+  const raw = process.env.OWNER_NOTIFY_LID?.trim() || "";
+  return raw ? normalizeChatId(raw) : "";
+}
+
 /** Minutes until a personal-DM reply reminder fires for Deepak (default 60). */
 export function getPersonalReplyDelayMinutes(): number {
   const n = Number(process.env.PERSONAL_REPLY_DELAY_MINUTES || 60);
@@ -72,13 +78,29 @@ export function isReminderGroupChat(chatId: string): boolean {
   return normalizeChatId(chatId) === normalizeChatId(group);
 }
 
-/** Skip DMs from your own notify phone (avoid loops). */
+/** Cached owner identities: phone @c.us + resolved @lid */
+let ownerIdentityCache: string[] | null = null;
+let ownerLidRefresh: Promise<void> | null = null;
+
+function baseOwnerIdentities(): string[] {
+  const ids: string[] = [];
+  const owner = getOwnerNotifyChatId();
+  if (owner) ids.push(owner);
+  const envLid = getOwnerNotifyLidFromEnv();
+  if (envLid) ids.push(envLid);
+  return ids;
+}
+
+/** Sync check using env + in-memory LID cache. */
 export function isOwnerNotifyChat(chatId: string): boolean {
+  const id = normalizeChatId(chatId);
+  const known = new Set(
+    [...baseOwnerIdentities(), ...(ownerIdentityCache || [])].map(normalizeChatId),
+  );
+  if (known.has(id)) return true;
+
   const owner = getOwnerNotifyChatId();
   if (!owner) return false;
-  const id = normalizeChatId(chatId);
-  if (id === owner) return true;
-  // Same phone digits when both are @c.us
   const ownerDigits = owner.replace(/@c\.us$/i, "").replace(/\D/g, "");
   const idDigits = id.replace(/@c\.us$/i, "").replace(/\D/g, "");
   return Boolean(
@@ -88,6 +110,45 @@ export function isOwnerNotifyChat(chatId: string): boolean {
       owner.endsWith("@c.us") &&
       ownerDigits === idDigits,
   );
+}
+
+/** Refresh owner @lid from WAHA (call from inbound paths). */
+export async function ensureOwnerNotifyIdentities(): Promise<string[]> {
+  if (ownerIdentityCache?.some((x) => x.endsWith("@lid"))) {
+    return [...baseOwnerIdentities(), ...ownerIdentityCache];
+  }
+  if (!ownerLidRefresh) {
+    ownerLidRefresh = (async () => {
+      const owner = getOwnerNotifyChatId();
+      if (!owner) {
+        ownerIdentityCache = baseOwnerIdentities();
+        return;
+      }
+      try {
+        const { fetchLidForPhoneJid } = await import("@/lib/waha");
+        const lid = await fetchLidForPhoneJid(owner);
+        const set = new Set(baseOwnerIdentities());
+        if (lid) set.add(normalizeChatId(lid));
+        ownerIdentityCache = [...set];
+      } catch (err) {
+        console.warn(
+          "[chat-routing] owner LID resolve failed:",
+          err instanceof Error ? err.message : err,
+        );
+        ownerIdentityCache = baseOwnerIdentities();
+      }
+    })().finally(() => {
+      ownerLidRefresh = null;
+    });
+  }
+  await ownerLidRefresh;
+  return [...baseOwnerIdentities(), ...(ownerIdentityCache || [])];
+}
+
+export async function isOwnerNotifyChatAsync(chatId: string): Promise<boolean> {
+  const ids = await ensureOwnerNotifyIdentities();
+  const id = normalizeChatId(chatId);
+  return ids.map(normalizeChatId).includes(id) || isOwnerNotifyChat(chatId);
 }
 
 /** Env WHATSAPP_CHAT_ID still used as default delivery for group-created reminders. */

@@ -420,6 +420,32 @@ export type WahaChatMessage = {
   media?: { url?: string | null; mimetype?: string | null; filename?: string | null } | null;
 };
 
+/**
+ * Resolve WhatsApp LID for a phone JID (`9198…@c.us` → `…@lid`).
+ * GOWS often delivers owner replies as @lid only.
+ */
+export async function fetchLidForPhoneJid(
+  phoneJid: string,
+): Promise<string | null> {
+  const { session } = getWahaServerConfig();
+  const pn = phoneJid.endsWith("@c.us")
+    ? phoneJid
+    : phoneJid.includes("@")
+      ? phoneJid
+      : `${phoneJid.replace(/\D/g, "")}@c.us`;
+  const encoded = encodeURIComponent(pn);
+  const res = await wahaFetch(
+    `/api/${encodeURIComponent(session)}/lids/pn/${encoded}`,
+  );
+  const raw = await readJson(res);
+  if (!res.ok) return null;
+  if (raw && typeof raw === "object") {
+    const lid = (raw as { lid?: string }).lid;
+    if (typeof lid === "string" && lid.endsWith("@lid")) return lid;
+  }
+  return null;
+}
+
 /** Recent messages in a chat (newest first). Used to poll snooze/commands locally. */
 export async function fetchChatMessages(
   chatId: string,

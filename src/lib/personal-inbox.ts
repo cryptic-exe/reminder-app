@@ -1,10 +1,12 @@
 import { prisma } from "@/lib/db";
 import { claimFingerprint, claimMessageId } from "@/lib/inbound-dedupe";
 import {
+  ensureOwnerNotifyIdentities,
   getOwnerNotifyChatId,
   getPersonalReplyDelayMinutes,
-  isOwnerNotifyChat,
+  isOwnerNotifyChatAsync,
   isPersonalChat,
+  normalizeChatId,
 } from "@/lib/chat-routing";
 import { formatInUserTz } from "@/lib/time";
 import { getUserTimezone } from "@/lib/env";
@@ -227,8 +229,10 @@ export async function processPersonalDm(input: {
     return { action: "ignored", ignored: true };
   }
 
-  // Owner phone messages are handoff decisions, not customer DMs
-  if (isOwnerNotifyChat(input.chatId)) {
+  await ensureOwnerNotifyIdentities();
+
+  // Owner phone (@c.us or @lid) → YES/NO handoff, never treat as customer DM
+  if (await isOwnerNotifyChatAsync(input.chatId)) {
     return processOwnerHandoffDecision({
       messageId: input.messageId,
       text: input.text,
@@ -237,6 +241,21 @@ export async function processPersonalDm(input: {
 
   const text = input.text.trim();
   if (!text) return { action: "ignored-empty", ignored: true };
+
+  // Bare YES/NO from a non-customer path that slipped through — still handoff
+  const maybeDecision = parseOwnerDecision(text);
+  if (maybeDecision.decision) {
+    // If this chat itself has awaiting_owner as customer, don't steal their "yes"
+    const selfPending = await prisma.personalDmQueue.findFirst({
+      where: { chatId: input.chatId, status: "awaiting_owner" },
+    });
+    if (!selfPending) {
+      return processOwnerHandoffDecision({
+        messageId: input.messageId,
+        text: input.text,
+      });
+    }
+  }
 
   const textKey = text.toLowerCase().replace(/\s+/g, " ").slice(0, 160);
   if (!(await claimFingerprint(`pdm:${textKey}`))) {
@@ -305,24 +324,35 @@ function parseOwnerDecision(text: string): {
 }
 
 async function findQueueForDecision(ref: string | null) {
+  const ownerIds = new Set(
+    (await ensureOwnerNotifyIdentities()).map(normalizeChatId),
+  );
+
+  const notOwner = (chatId: string) => !ownerIds.has(normalizeChatId(chatId));
+
   if (ref) {
-    const matches = await prisma.personalDmQueue.findMany({
-      where: {
-        status: "awaiting_owner",
-        id: { endsWith: ref },
-      },
-      orderBy: { createdAt: "desc" },
-      take: 5,
-    });
-    if (matches.length === 1) return matches[0];
-    if (matches.length > 1) {
+    const matches = (
+      await prisma.personalDmQueue.findMany({
+        where: {
+          status: "awaiting_owner",
+          id: { endsWith: ref },
+        },
+        orderBy: { createdAt: "desc" },
+        take: 10,
+      })
+    ).filter((m) => notOwner(m.chatId));
+    if (matches.length >= 1) {
       return matches.find((m) => m.id.endsWith(ref)) ?? matches[0];
     }
   }
-  return prisma.personalDmQueue.findFirst({
+
+  // Prefer real customer DMs — never the owner's own YES/NO echoed as queue rows
+  const pending = await prisma.personalDmQueue.findMany({
     where: { status: "awaiting_owner" },
     orderBy: { createdAt: "desc" },
+    take: 20,
   });
+  return pending.find((m) => notOwner(m.chatId)) ?? null;
 }
 
 /**
