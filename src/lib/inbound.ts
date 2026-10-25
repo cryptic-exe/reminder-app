@@ -71,6 +71,7 @@ export function isBotEcho(text: string): boolean {
     t.startsWith("Could not parse") ||
     t.startsWith("No upcoming reminders") ||
     t.startsWith("I'm an AI") ||
+    t.startsWith("Main Deepak ka AI") ||
     t.startsWith("✅ AI replied") ||
     t.startsWith("🤝 Needs you")
   );
