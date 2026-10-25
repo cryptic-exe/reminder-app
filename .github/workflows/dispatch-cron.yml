@@ -4,7 +4,8 @@ name: Dispatch due reminders
 
 on:
   schedule:
-    - cron: "* * * * *"
+    # Every 5 minutes (GitHub often skips/throttles "* * * * *")
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -17,16 +18,18 @@ jobs:
           APP_URL: ${{ vars.APP_URL }}
         run: |
           set -euo pipefail
-          BASE="${APP_URL:-https://reminder-app.vercel.app}"
+          BASE="${APP_URL:-https://reminder-app-rust-zeta.vercel.app}"
           BASE="${BASE%/}"
           if [ -z "${CRON_SECRET:-}" ]; then
             echo "Missing GitHub secret CRON_SECRET"
             exit 1
           fi
+          echo "Dispatching ${BASE}/api/cron/dispatch"
           code=$(curl -sS -o /tmp/dispatch-body.txt -w "%{http_code}" \
+            --max-time 55 \
             -H "Authorization: Bearer ${CRON_SECRET}" \
             "${BASE}/api/cron/dispatch")
           echo "HTTP ${code}"
-          head -c 500 /tmp/dispatch-body.txt || true
+          head -c 800 /tmp/dispatch-body.txt || true
           echo
           test "$code" = "200"

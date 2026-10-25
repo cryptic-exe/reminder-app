@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { normalizeChatId } from "@/lib/chat-routing";
 import { getWebhookSecret } from "@/lib/env";
 import { routeInboundMessage } from "@/lib/inbound-router";
+import { processDuePersonalDmReplies } from "@/lib/personal-inbox";
 
 export const maxDuration = 60;
 
@@ -102,7 +103,24 @@ export async function POST(request: Request) {
       media,
       hasMedia,
     });
-    return NextResponse.json({ ok: true, ...result, fromMe, chatId });
+
+    // GitHub Actions minute cron is often delayed — also drain due AI DMs here
+    // whenever WhatsApp traffic hits us (including Deepak's own replies).
+    const personalDm = await processDuePersonalDmReplies().catch((err) => {
+      console.warn(
+        "[webhook] personal DM drain failed:",
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    });
+
+    return NextResponse.json({
+      ok: true,
+      ...result,
+      fromMe,
+      chatId,
+      personalDm,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ ok: false, error: message }, { status: 500 });
