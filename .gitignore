@@ -60,3 +60,4 @@ next-env.d.ts
 # capacitor native projects (add separately if needed)
 /ios
 /android
+.env*

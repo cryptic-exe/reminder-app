@@ -1,0 +1,32 @@
+# Vercel Hobby only runs platform crons once per day.
+# This workflow hits the dispatch endpoint every minute so reminders stay on time.
+name: Dispatch due reminders
+
+on:
+  schedule:
+    - cron: "* * * * *"
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call production cron
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          set -euo pipefail
+          BASE="${APP_URL:-https://reminder-app.vercel.app}"
+          BASE="${BASE%/}"
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "Missing GitHub secret CRON_SECRET"
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/dispatch-body.txt -w "%{http_code}" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            "${BASE}/api/cron/dispatch")
+          echo "HTTP ${code}"
+          head -c 500 /tmp/dispatch-body.txt || true
+          echo
+          test "$code" = "200"
