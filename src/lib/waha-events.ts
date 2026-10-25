@@ -230,11 +230,26 @@ function connect() {
   });
 }
 
-/** Outbound WebSocket to WAHA so localhost can receive fromMe replies. */
+/**
+ * Outbound WebSocket to WAHA for local inbound.
+ * Keep disabled when production already receives the same events via webhook —
+ * otherwise every DM gets two AI replies (local DB + Neon).
+ */
 export function startWahaEventListener() {
   if (started) return;
   if (process.env.VERCEL) return;
   if (process.env.DISABLE_WAHA_WS === "1") return;
+  // Default off when WAHA is remote (webhook → Vercel is the live path)
+  const base = process.env.WAHA_BASE_URL || "";
+  const remote =
+    base.includes("://") &&
+    !/localhost|127\.0\.0\.1/i.test(base);
+  if (remote && process.env.ENABLE_WAHA_WS !== "1") {
+    console.log(
+      "[waha-ws] skipped — remote WAHA (set ENABLE_WAHA_WS=1 to listen locally)",
+    );
+    return;
+  }
   started = true;
   setTimeout(connect, 3_000);
 }

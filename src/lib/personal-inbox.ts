@@ -60,11 +60,13 @@ export async function processPersonalDm(input: {
   const text = input.text.trim();
   if (!text) return { action: "ignored-empty", ignored: true };
 
-  if (!(await claimMessageId(input.messageId))) {
+  // Text-only fingerprint (no chatId): same DM can arrive as @lid and @c.us.
+  // Claim before LLM so concurrent webhook + local WS cannot both reply.
+  const textKey = text.toLowerCase().replace(/\s+/g, " ").slice(0, 160);
+  if (!(await claimFingerprint(`pdm:${textKey}`))) {
     return { action: "create-dup", ignored: true };
   }
-  const fp = `personal-dm:${input.chatId}:${text.slice(0, 120)}`;
-  if (!(await claimFingerprint(fp))) {
+  if (!(await claimMessageId(input.messageId))) {
     return { action: "create-dup", ignored: true };
   }
 

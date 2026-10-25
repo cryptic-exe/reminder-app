@@ -24,11 +24,25 @@ async function claimKey(key: string): Promise<boolean> {
   }
 }
 
+/**
+ * GOWS ids look like `false_1269…@lid_2A3F4F09…` — the trailing segment is stable
+ * even when chat addressing flips between @lid and @c.us.
+ */
+function messageIdCore(id: string): string | null {
+  const parts = id.split("_").filter(Boolean);
+  if (parts.length < 2) return null;
+  const core = parts[parts.length - 1]!;
+  return core.length >= 8 ? core : null;
+}
+
 /** Returns true if this message id was newly claimed (false if already seen). */
 export async function claimMessageId(
   id: string | null | undefined,
 ): Promise<boolean> {
   if (!id) return true;
+  const core = messageIdCore(id);
+  // Shared core first so parallel lid/c.us deliveries collapse to one
+  if (core && !(await claimKey(`idcore:${core}`))) return false;
   return claimKey(`id:${id}`);
 }
 
