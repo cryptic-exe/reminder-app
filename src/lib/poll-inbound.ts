@@ -47,7 +47,8 @@ export async function pollInboundWhatsApp(): Promise<{
     return { checked: 0, handled };
   }
 
-  const since = Math.floor(Date.now() / 1000) - 90;
+  // Wide enough for Hobby cron + GitHub Actions minute lag (was 90s — too tight)
+  const since = Math.floor(Date.now() / 1000) - 30 * 60;
   let checked = 0;
 
   for (const chatId of chatIds) {
