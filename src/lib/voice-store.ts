@@ -2,7 +2,13 @@ import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 import { randomBytes } from "crypto";
 
-const VOICE_DIR = path.join(process.cwd(), ".data", "voice");
+function voiceDir(): string {
+  // Vercel: only /tmp is writable (ephemeral — text reminders are the reliable path there)
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.join("/tmp", "reminder-data", "voice");
+  }
+  return path.join(process.cwd(), ".data", "voice");
+}
 
 function extForMime(mime: string): string {
   if (mime.includes("ogg") || mime.includes("opus")) return "ogg";
@@ -18,12 +24,13 @@ export async function saveVoiceFile(
   bytes: Buffer,
   mime: string,
 ): Promise<{ relativePath: string; absPath: string }> {
-  await mkdir(VOICE_DIR, { recursive: true });
+  const dir = voiceDir();
+  await mkdir(dir, { recursive: true });
   const name = `${Date.now()}-${randomBytes(4).toString("hex")}.${extForMime(mime)}`;
-  const absPath = path.join(VOICE_DIR, name);
+  const absPath = path.join(dir, name);
   await writeFile(absPath, bytes);
   return {
-    relativePath: path.join(".data", "voice", name),
+    relativePath: absPath,
     absPath,
   };
 }

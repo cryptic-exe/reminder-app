@@ -7,14 +7,24 @@ type Store = {
   fingerprints: Array<{ key: string; at: number }>;
 };
 
-const DIR = path.join(process.cwd(), ".data");
-const FILE = path.join(DIR, "inbound-dedupe.json");
+/** Vercel serverless filesystem is read-only except /tmp. */
+function dataDir(): string {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.join("/tmp", "reminder-data");
+  }
+  return path.join(process.cwd(), ".data");
+}
+
+function storeFile(): string {
+  return path.join(dataDir(), "inbound-dedupe.json");
+}
+
 const MAX_IDS = 300;
 const FINGERPRINT_TTL_MS = 90_000;
 
 async function load(): Promise<Store> {
   try {
-    const raw = await readFile(FILE, "utf8");
+    const raw = await readFile(storeFile(), "utf8");
     const parsed = JSON.parse(raw) as Store;
     return {
       seenIds: Array.isArray(parsed.seenIds) ? parsed.seenIds : [],
@@ -26,11 +36,12 @@ async function load(): Promise<Store> {
 }
 
 async function save(store: Store): Promise<void> {
-  await mkdir(DIR, { recursive: true });
-  await writeFile(FILE, JSON.stringify(store), "utf8");
+  const dir = dataDir();
+  await mkdir(dir, { recursive: true });
+  await writeFile(storeFile(), JSON.stringify(store), "utf8");
 }
 
-/** Returns true if this message id was already handled (and marks it seen). */
+/** Returns true if this message id was newly claimed (false if already seen). */
 export async function claimMessageId(id: string | null | undefined): Promise<boolean> {
   if (!id) return true; // no id → allow (fingerprint may still catch)
   const store = await load();
@@ -43,7 +54,7 @@ export async function claimMessageId(id: string | null | undefined): Promise<boo
   return true;
 }
 
-/** Returns true if this text was already handled recently (and marks it). */
+/** Returns true if this text was newly claimed (false if handled recently). */
 export async function claimFingerprint(text: string): Promise<boolean> {
   const key = text.trim().toLowerCase().replace(/\s+/g, " ");
   if (!key) return true;
