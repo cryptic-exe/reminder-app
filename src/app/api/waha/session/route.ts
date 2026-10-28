@@ -10,10 +10,18 @@ import {
   restartWahaSession,
   startWahaSession,
   stopWahaSession,
+  syncWahaInboundFilters,
 } from "@/lib/waha";
 
 const ActionSchema = z.object({
-  action: z.enum(["start", "stop", "restart", "logout", "ensure"]),
+  action: z.enum([
+    "start",
+    "stop",
+    "restart",
+    "logout",
+    "ensure",
+    "sync-inbound",
+  ]),
 });
 
 export async function GET() {
@@ -39,6 +47,7 @@ export async function POST(request: Request) {
     const { action } = ActionSchema.parse(await request.json());
 
     let session = null;
+    let inbound = null;
     switch (action) {
       case "ensure":
         session = await ensureWahaSession();
@@ -55,9 +64,13 @@ export async function POST(request: Request) {
       case "logout":
         session = await logoutWahaSession();
         break;
+      case "sync-inbound":
+        inbound = await syncWahaInboundFilters();
+        session = await getWahaSession();
+        break;
     }
 
-    return NextResponse.json({ session });
+    return NextResponse.json({ session, inbound });
   } catch (error) {
     return jsonError(error, 400);
   }

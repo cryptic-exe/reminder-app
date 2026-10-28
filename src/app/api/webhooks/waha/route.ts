@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
-import { normalizeChatId } from "@/lib/chat-routing";
+import {
+  isWatchedInboundChat,
+  normalizeChatId,
+} from "@/lib/chat-routing";
 import { getWebhookSecret } from "@/lib/env";
 import { routeInboundMessage } from "@/lib/inbound-router";
 import { processDuePersonalDmReplies } from "@/lib/personal-inbox";
@@ -70,6 +73,18 @@ export async function POST(request: Request) {
 
   const fromMe = payload.fromMe === true;
   const chatId = extractChatId(payload, fromMe);
+
+  // Drop other groups / status / channels before routing or DM drain.
+  // (WAHA cannot allowlist a single group; engine ignore covers type-level only.)
+  if (!isWatchedInboundChat(chatId)) {
+    return NextResponse.json({
+      ok: true,
+      ignored: true,
+      reason: "unwatched-chat",
+      chatId,
+    });
+  }
+
   const text =
     (typeof payload.body === "string" && payload.body) ||
     (typeof payload.text === "string" && payload.text) ||
@@ -105,7 +120,7 @@ export async function POST(request: Request) {
     });
 
     // GitHub Actions minute cron is often delayed — also drain due AI DMs here
-    // whenever WhatsApp traffic hits us (including Deepak's own replies).
+    // whenever watched WhatsApp traffic hits us.
     const personalDm = await processDuePersonalDmReplies().catch((err) => {
       console.warn(
         "[webhook] personal DM drain failed:",
@@ -130,6 +145,6 @@ export async function POST(request: Request) {
 export async function GET() {
   return NextResponse.json({
     ok: true,
-    hint: "POST WAHA message.any — reminder group commands + personal DM reply reminders",
+    hint: "POST WAHA message.any — reminder group + personal DMs only (other groups dropped)",
   });
 }

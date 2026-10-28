@@ -41,6 +41,7 @@ Open [http://localhost:3000](http://localhost:3000) and sign in with `APP_PASSWO
 ## Debugging
 
 - Inbound WhatsApp: check WAHA webhook URL and `CRON_SECRET` / `WAHA_WEBHOOK_SECRET`.
+- WAHA has no per-chat webhook allowlist. Use `config.ignore` for status/channels/broadcast (`POST /api/waha/session` action `sync-inbound`); keep `groups: false` so the reminder group still works. Non-reminder groups are dropped in `/api/webhooks/waha`.
 - Voice notes: ensure WAHA has media download enabled (`WHATSAPP_DOWNLOAD_MEDIA=true`).
 - Parse quality: confirm at least one working key in `llm-keys.json`; local deterministic parse covers common English phrases.
 

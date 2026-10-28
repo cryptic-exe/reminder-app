@@ -78,6 +78,20 @@ export function isReminderGroupChat(chatId: string): boolean {
   return normalizeChatId(chatId) === normalizeChatId(group);
 }
 
+/**
+ * Chats the app cares about on inbound webhooks.
+ * WAHA can only ignore whole types (status/channels/broadcast), not a single group —
+ * so other `@g.us` chats are dropped here before heavier work.
+ */
+export function isWatchedInboundChat(chatId: string): boolean {
+  const id = normalizeChatId(chatId);
+  if (!id) return false;
+  if (id === "status@broadcast" || id.endsWith("@broadcast")) return false;
+  if (id.endsWith("@newsletter")) return false;
+  if (isGroupChat(id)) return isReminderGroupChat(id);
+  return isPersonalChat(id);
+}
+
 /** Cached owner identities: phone @c.us + resolved @lid */
 let ownerIdentityCache: string[] | null = null;
 let ownerLidRefresh: Promise<void> | null = null;

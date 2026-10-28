@@ -506,3 +506,116 @@ export async function fetchChatMessages(
     })
     .filter((m): m is WahaChatMessage => m != null);
 }
+
+export type WahaInboundIgnoreConfig = {
+  status: boolean;
+  groups: boolean;
+  channels: boolean;
+  broadcast: boolean;
+};
+
+/**
+ * WAHA only filters by chat *type* (`config.ignore`), not by a specific group id.
+ * Keep `groups: false` so the reminder group still webhooks + stores; drop
+ * status / channels / broadcast at the engine to cut Fast Data Transfer.
+ */
+export const WAHA_INBOUND_IGNORE: WahaInboundIgnoreConfig = {
+  status: true,
+  groups: false,
+  channels: true,
+  broadcast: true,
+};
+
+function resolveWebhookPublicUrl(): string | null {
+  const fromEnv =
+    process.env.WAHA_WEBHOOK_URL?.trim() ||
+    process.env.APP_URL?.trim() ||
+    process.env.VERCEL_PROJECT_PRODUCTION_URL?.trim() ||
+    "";
+  if (!fromEnv) return null;
+  const base = fromEnv.startsWith("http")
+    ? fromEnv.replace(/\/$/, "")
+    : `https://${fromEnv.replace(/\/$/, "")}`;
+  if (base.includes("/api/webhooks/waha")) return base;
+  return `${base}/api/webhooks/waha`;
+}
+
+/**
+ * Apply engine-side ignore filters and (when URL+secret known) the prod webhook.
+ * Preserves an existing webhook URL if env does not define one.
+ */
+export async function syncWahaInboundFilters(options?: {
+  webhookUrl?: string | null;
+  webhookSecret?: string | null;
+}): Promise<{
+  ignore: WahaInboundIgnoreConfig;
+  webhookUrl: string | null;
+  events: string[];
+}> {
+  const { session } = getWahaServerConfig();
+  const existing = await getWahaSession();
+  if (!existing) {
+    throw new Error("WAHA session does not exist yet");
+  }
+
+  const raw = existing.raw as {
+    config?: {
+      ignore?: Partial<WahaInboundIgnoreConfig>;
+      webhooks?: Array<{
+        url?: string;
+        events?: string[];
+        retries?: { delaySeconds?: number; attempts?: number };
+      }>;
+    };
+  };
+
+  const secret =
+    options?.webhookSecret?.trim() ||
+    process.env.WAHA_WEBHOOK_SECRET?.trim() ||
+    process.env.CRON_SECRET?.trim() ||
+    "";
+
+  let webhookUrl =
+    options?.webhookUrl?.trim() ||
+    resolveWebhookPublicUrl() ||
+    raw.config?.webhooks?.[0]?.url ||
+    null;
+
+  if (webhookUrl && secret && !webhookUrl.includes("secret=")) {
+    const joiner = webhookUrl.includes("?") ? "&" : "?";
+    webhookUrl = `${webhookUrl}${joiner}secret=${encodeURIComponent(secret)}`;
+  }
+
+  const events = ["message.any"] as string[];
+  const webhooks = webhookUrl
+    ? [
+        {
+          url: webhookUrl,
+          events,
+          retries: {
+            delaySeconds: 2,
+            attempts: 3,
+          },
+        },
+      ]
+    : (raw.config?.webhooks ?? []);
+
+  const res = await wahaFetch(`/api/sessions/${encodeURIComponent(session)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      name: session,
+      config: {
+        ignore: WAHA_INBOUND_IGNORE,
+        webhooks,
+      },
+    }),
+  });
+  const body = await readJson(res);
+  if (!res.ok) throw wahaError("sync inbound filters", res, body);
+
+  return {
+    ignore: WAHA_INBOUND_IGNORE,
+    webhookUrl: webhookUrl ?? null,
+    events,
+  };
+}

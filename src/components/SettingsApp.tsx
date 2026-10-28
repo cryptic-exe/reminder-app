@@ -167,9 +167,12 @@ export function SettingsApp() {
         <p className="mt-1 text-sm text-zinc-500">
           Locally the app listens to WAHA over a WebSocket, so{" "}
           <code className="text-xs">snooze 10</code> works even when you reply
-          from the same linked phone. On a public deploy, also set WAHA{" "}
+          from the same linked phone. On a public deploy, set WAHA{" "}
           <code className="text-xs">message.any</code> webhooks here (Bearer /{" "}
-          <code className="text-xs">?secret=</code> = CRON_SECRET).
+          <code className="text-xs">?secret=</code> = CRON_SECRET). Engine{" "}
+          <code className="text-xs">config.ignore</code> drops status /
+          channels / broadcast; other groups are rejected in the webhook (WAHA
+          cannot allowlist a single group).
         </p>
         <p className="mt-3 break-all rounded-lg bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900">
           {webhookUrl}?secret=YOUR_CRON_SECRET
